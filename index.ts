@@ -144,6 +144,7 @@ interface TelegramPreviewState {
 	pendingText: string;
 	lastSentText: string;
 	flushTimer?: ReturnType<typeof setTimeout>;
+	flushing: boolean;  // NEW: concurrency guard
 }
 
 interface TelegramMediaGroupState {
@@ -343,7 +344,14 @@ export default function (pi: ExtensionAPI) {
 			body: JSON.stringify(body),
 			signal: options?.signal,
 		});
-			const data = (await response.json()) as TelegramApiResponse<TResponse>;
+		let data: TelegramApiResponse<TResponse>;
+		try {
+			data = (await response.json()) as TelegramApiResponse<TResponse>;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Telegram API ${method} JSON parse failed: ${message}`);
+		}
+
 		if (!data.ok || data.result === undefined) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
@@ -370,7 +378,14 @@ export default function (pi: ExtensionAPI) {
 			body: form,
 			signal: options?.signal,
 		});
-		const data = (await response.json()) as TelegramApiResponse<TResponse>;
+		let data: TelegramApiResponse<TResponse>;
+		try {
+			data = (await response.json()) as TelegramApiResponse<TResponse>;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Telegram API ${method} JSON parse failed: ${message}`);
+		}
+
 		if (!data.ok || data.result === undefined) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
@@ -437,6 +452,8 @@ export default function (pi: ExtensionAPI) {
 			state.flushTimer = undefined;
 		}
 		previewState = undefined;
+		// If flushing, skip the Telegram call (we're shutting down anyway)
+		if (state.flushing) return;
 		if (state.mode === "draft" && state.draftId !== undefined) {
 			try {
 				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: state.draftId, text: "" });
@@ -448,40 +465,55 @@ export default function (pi: ExtensionAPI) {
 
 	async function flushPreview(chatId: number): Promise<void> {
 		const state = previewState;
-		if (!state) return;
-		state.flushTimer = undefined;
-		const text = state.pendingText.trim();
-		if (!text || text === state.lastSentText) return;
-		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
+		if (!state || state.flushing) return;  // NEW: skip if already flushing
+		state.flushing = true;                  // NEW: acquire lock
+		try {
+			state.flushTimer = undefined;
+			const text = state.pendingText.trim();
+			if (!text || text === state.lastSentText) return;
+			const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
 
-		if (draftSupport !== "unsupported") {
-			const draftId = state.draftId ?? allocateDraftId();
-			state.draftId = draftId;
-			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
-				draftSupport = "supported";
-				state.mode = "draft";
+			if (draftSupport !== "unsupported") {
+				const draftId = state.draftId ?? allocateDraftId();
+				state.draftId = draftId;
+				try {
+					await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+					draftSupport = "supported";
+					state.mode = "draft";
+					state.lastSentText = truncated;
+					return;
+				} catch {
+					draftSupport = "unsupported";
+				}
+			}
+
+			if (state.messageId === undefined) {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+				state.messageId = sent.message_id;
+				state.mode = "message";
 				state.lastSentText = truncated;
 				return;
-			} catch {
-				draftSupport = "unsupported";
 			}
-		}
-
-		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
-			state.messageId = sent.message_id;
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
 			state.mode = "message";
 			state.lastSentText = truncated;
-			return;
+		} finally {
+			state.flushing = false;  // NEW: release lock
+			// If pendingText changed while we were flushing, schedule another flush
+			if (state.pendingText.trim() !== state.lastSentText && !state.flushTimer) {
+				schedulePreviewFlush(chatId);
+			}
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
-		state.mode = "message";
-		state.lastSentText = truncated;
-	}
+}
 
 	function schedulePreviewFlush(chatId: number): void {
-		if (!previewState || previewState.flushTimer) return;
+		if (!previewState) return;
+		// If flushing, don't schedule — the finally block in flushPreview will re-schedule
+		if (previewState.flushing) return;
+		if (previewState.flushTimer) {
+			// Timer exists, just let it fire — it'll pick up the latest pendingText
+			return;
+		}
 		previewState.flushTimer = setTimeout(() => {
 			void flushPreview(chatId);
 		}, PREVIEW_THROTTLE_MS);
@@ -1056,7 +1088,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
-				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+				previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "", flushing: false };
 				startTypingLoop(ctx);
 			}
 		}
@@ -1068,13 +1100,13 @@ export default function (pi: ExtensionAPI) {
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
 			await finalizePreview(activeTelegramTurn.chatId);
 		}
-		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "", flushing: false };
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "", flushing: false };
 		}
 		previewState.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
