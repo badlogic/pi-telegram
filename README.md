@@ -39,10 +39,16 @@ Start pi, then run:
 
 Paste the bot token when prompted.
 
-The extension stores config in:
+Existing installs continue to use the legacy config file:
 
 ```text
 ~/.pi/agent/telegram.json
+```
+
+Named profile configs are stored in:
+
+```text
+~/.pi/agent/telegram/<profile>.json
 ```
 
 ## Connect a pi session
@@ -51,6 +57,12 @@ The Telegram bridge is session-local. Connect it only in the pi session that sho
 
 ```bash
 /telegram-connect
+```
+
+You can also connect a named profile explicitly:
+
+```bash
+/telegram-connect my-project
 ```
 
 To stop polling in the current session:
@@ -63,6 +75,38 @@ Check status:
 
 ```bash
 /telegram-status
+```
+
+## One bot per project
+
+To use separate Telegram bots/chats for separate projects, create one profile per project:
+
+```bash
+cd /home/lane/projects/srm
+pi
+/telegram-setup srm
+/telegram-connect srm
+```
+
+When run from a project directory, `/telegram-setup` without an argument defaults to the current directory basename, so this also creates `srm`:
+
+```bash
+/telegram-setup
+```
+
+Profile resolution uses this order:
+
+1. explicit command argument, for example `/telegram-connect srm`
+2. `PI_TELEGRAM_PROFILE`, for example `PI_TELEGRAM_PROFILE=srm pi`
+3. a config matching the current directory basename, for example `srm` for `/home/lane/projects/srm`
+4. legacy `~/.pi/agent/telegram.json`
+
+For `/telegram-setup`, the current directory basename is used even before the profile file exists. For `/telegram-connect` and session startup, once `~/.pi/agent/telegram/srm.json` exists, running from `/home/lane/projects/srm` selects it automatically. If no matching profile exists, existing legacy config remains the fallback.
+
+A lightweight lock file prevents two pi sessions from polling the same profile at once:
+
+```text
+~/.pi/agent/telegram/<profile>.lock
 ```
 
 ## Pair your Telegram account
