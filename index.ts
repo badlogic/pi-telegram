@@ -1,5 +1,6 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
@@ -13,6 +14,14 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+}
+
+interface TelegramConfigTarget {
+	profile?: string;
+	path: string;
+	lockPath: string;
+	isLegacy: boolean;
+	source: "command" | "env" | "cwd" | "legacy";
 }
 
 interface TelegramApiResponse<T> {
@@ -151,8 +160,11 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
-const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
+const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
+const LEGACY_CONFIG_PATH = join(PI_AGENT_DIR, "telegram.json");
+const TELEGRAM_CONFIG_DIR = join(PI_AGENT_DIR, "telegram");
+const LEGACY_LOCK_PATH = join(PI_AGENT_DIR, "telegram.lock");
+const TEMP_DIR = join(PI_AGENT_DIR, "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -269,9 +281,93 @@ function chunkParagraphs(text: string): string[] {
 	return chunks;
 }
 
-async function readConfig(): Promise<TelegramConfig> {
+async function pathExists(path: string): Promise<boolean> {
 	try {
-		const content = await readFile(CONFIG_PATH, "utf8");
+		await stat(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function validateProfileName(rawProfile: string): string {
+	const profile = rawProfile.trim();
+	if (!profile) throw new Error("Telegram profile name cannot be empty");
+	if (profile === "." || profile === ".." || !/^[a-zA-Z0-9._-]+$/.test(profile)) {
+		throw new Error("Telegram profile names may only contain letters, numbers, dots, underscores, and dashes");
+	}
+	return profile;
+}
+
+function inferProfileFromCwd(cwd: string): string | undefined {
+	const inferred = sanitizeFileName(basename(cwd)).replace(/^\.+/, "");
+	return inferred ? validateProfileName(inferred) : undefined;
+}
+
+function profileConfigPath(profile: string): string {
+	return join(TELEGRAM_CONFIG_DIR, `${profile}.json`);
+}
+
+function profileLockPath(profile: string): string {
+	return join(TELEGRAM_CONFIG_DIR, `${profile}.lock`);
+}
+
+function getConfigTarget(profile: string | undefined, source: TelegramConfigTarget["source"]): TelegramConfigTarget {
+	if (!profile) {
+		return {
+			path: LEGACY_CONFIG_PATH,
+			lockPath: LEGACY_LOCK_PATH,
+			isLegacy: true,
+			source,
+		};
+	}
+	return {
+		profile,
+		path: profileConfigPath(profile),
+		lockPath: profileLockPath(profile),
+		isLegacy: false,
+		source,
+	};
+}
+
+function getTargetLabel(target: TelegramConfigTarget): string {
+	return target.profile ?? "legacy";
+}
+
+function parseProfileArg(args: string): string | undefined {
+	const first = args.trim().split(/\s+/).find(Boolean);
+	return first ? validateProfileName(first) : undefined;
+}
+
+async function resolveConfigTarget(
+	args: string,
+	ctx: ExtensionContext,
+	mode: "setup" | "connect" | "session" = "connect",
+): Promise<TelegramConfigTarget> {
+	const explicitProfile = parseProfileArg(args);
+	if (explicitProfile) return getConfigTarget(explicitProfile, "command");
+
+	const envProfile = process.env.PI_TELEGRAM_PROFILE?.trim();
+	if (envProfile) return getConfigTarget(validateProfileName(envProfile), "env");
+
+	const cwdProfile = inferProfileFromCwd(ctx.cwd);
+	if (mode === "setup" && cwdProfile) return getConfigTarget(cwdProfile, "cwd");
+
+	if (cwdProfile && (await pathExists(profileConfigPath(cwdProfile)))) {
+		return getConfigTarget(cwdProfile, "cwd");
+	}
+
+	if (await pathExists(LEGACY_CONFIG_PATH)) {
+		return getConfigTarget(undefined, "legacy");
+	}
+
+	if (cwdProfile) return getConfigTarget(cwdProfile, "cwd");
+	return getConfigTarget(undefined, "legacy");
+}
+
+async function readConfig(path: string): Promise<TelegramConfig> {
+	try {
+		const content = await readFile(path, "utf8");
 		const parsed = JSON.parse(content) as TelegramConfig;
 		return parsed;
 	} catch {
@@ -279,13 +375,17 @@ async function readConfig(): Promise<TelegramConfig> {
 	}
 }
 
-async function writeConfig(config: TelegramConfig): Promise<void> {
-	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
+async function writeConfig(path: string, config: TelegramConfig): Promise<void> {
+	const directory = path === LEGACY_CONFIG_PATH ? PI_AGENT_DIR : TELEGRAM_CONFIG_DIR;
+	await mkdir(directory, { recursive: true });
+	await writeFile(path, JSON.stringify(config, null, "\t") + "\n", "utf8");
 }
 
 export default function (pi: ExtensionAPI) {
+	let configTarget: TelegramConfigTarget = getConfigTarget(undefined, "legacy");
 	let config: TelegramConfig = {};
+	let activeLockPath: string | undefined;
+	let activeLockId: string | undefined;
 	let pollingController: AbortController | undefined;
 	let pollingPromise: Promise<void> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
@@ -299,6 +399,74 @@ export default function (pi: ExtensionAPI) {
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
+	async function writeActiveConfig(): Promise<void> {
+		await writeConfig(configTarget.path, config);
+	}
+
+	async function loadConfigTarget(target: TelegramConfigTarget): Promise<void> {
+		configTarget = target;
+		config = await readConfig(target.path);
+	}
+
+	function isProcessAlive(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function acquireProfileLock(ctx: ExtensionContext): Promise<void> {
+		if (activeLockPath === configTarget.lockPath) return;
+		await mkdir(configTarget.isLegacy ? PI_AGENT_DIR : TELEGRAM_CONFIG_DIR, { recursive: true });
+		const lockId = randomUUID();
+		const payload = JSON.stringify(
+			{
+				lockId,
+				pid: process.pid,
+				profile: getTargetLabel(configTarget),
+				cwd: ctx.cwd,
+				createdAt: new Date().toISOString(),
+			},
+			null,
+			"\t",
+		);
+
+		try {
+			await writeFile(configTarget.lockPath, payload + "\n", { flag: "wx" });
+		} catch {
+			let lock: { pid?: number; cwd?: string } = {};
+			try {
+				lock = JSON.parse(await readFile(configTarget.lockPath, "utf8")) as { pid?: number; cwd?: string };
+			} catch {
+				// Treat unreadable locks as stale and replace them.
+			}
+			if (lock.pid && isProcessAlive(lock.pid)) {
+				const cwd = lock.cwd ? ` from ${lock.cwd}` : "";
+				throw new Error(`Telegram profile "${getTargetLabel(configTarget)}" is already connected by PID ${lock.pid}${cwd}`);
+			}
+			await writeFile(configTarget.lockPath, payload + "\n", { flag: "w" });
+		}
+
+		activeLockPath = configTarget.lockPath;
+		activeLockId = lockId;
+	}
+
+	async function releaseProfileLock(): Promise<void> {
+		if (!activeLockPath || !activeLockId) return;
+		const lockPath = activeLockPath;
+		const lockId = activeLockId;
+		activeLockPath = undefined;
+		activeLockId = undefined;
+		try {
+			const lock = JSON.parse(await readFile(lockPath, "utf8")) as { lockId?: string };
+			if (lock.lockId === lockId) await unlink(lockPath);
+		} catch {
+			// ignore
+		}
+	}
+
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
 		return nextDraftId;
@@ -306,7 +474,7 @@ export default function (pi: ExtensionAPI) {
 
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
 		const theme = ctx.ui.theme;
-		const label = theme.fg("accent", "telegram");
+		const label = theme.fg("accent", configTarget.isLegacy ? "telegram" : `telegram:${configTarget.profile}`);
 		if (error) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`);
 			return;
@@ -637,11 +805,15 @@ export default function (pi: ExtensionAPI) {
 		return downloaded;
 	}
 
-	async function promptForConfig(ctx: ExtensionContext): Promise<void> {
+	async function promptForConfig(ctx: ExtensionContext, target?: TelegramConfigTarget): Promise<void> {
 		if (!ctx.hasUI || setupInProgress) return;
 		setupInProgress = true;
 		try {
-			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
+			if (target && target.path !== configTarget.path) {
+				await stopPolling();
+				await loadConfigTarget(target);
+			}
+			const token = await ctx.ui.input(`Telegram bot token (${getTargetLabel(configTarget)})`, "123456:ABCDEF...");
 			if (!token) return;
 
 			const nextConfig: TelegramConfig = { ...config, botToken: token.trim() };
@@ -654,12 +826,12 @@ export default function (pi: ExtensionAPI) {
 
 			nextConfig.botId = data.result.id;
 			nextConfig.botUsername = data.result.username;
+			if (pollingPromise) await stopPolling();
 			config = nextConfig;
-			await writeConfig(config);
+			await writeActiveConfig();
 			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
 			ctx.ui.notify("Send /start to your bot in Telegram to pair this extension with your account.", "info");
 			await startPolling(ctx);
-			updateStatus(ctx);
 		} finally {
 			setupInProgress = false;
 		}
@@ -671,6 +843,7 @@ export default function (pi: ExtensionAPI) {
 		pollingController = undefined;
 		await pollingPromise?.catch(() => undefined);
 		pollingPromise = undefined;
+		await releaseProfileLock();
 	}
 
 	function formatTelegramHistoryText(rawText: string, files: DownloadedTelegramFile[]): string {
@@ -828,7 +1001,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
-				await writeConfig(config);
+				await writeActiveConfig();
 				updateStatus(ctx);
 			}
 			return;
@@ -870,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (config.allowedUserId === undefined) {
 			config.allowedUserId = message.from.id;
-			await writeConfig(config);
+			await writeActiveConfig();
 			updateStatus(ctx);
 			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
 		}
@@ -898,7 +1071,7 @@ export default function (pi: ExtensionAPI) {
 				const last = updates.at(-1);
 				if (last) {
 					config.lastUpdateId = last.update_id;
-					await writeConfig(config);
+					await writeActiveConfig();
 				}
 			} catch {
 				// ignore
@@ -919,7 +1092,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				for (const update of updates) {
 					config.lastUpdateId = update.update_id;
-					await writeConfig(config);
+					await writeActiveConfig();
 					await handleUpdate(update, ctx);
 				}
 			} catch (error) {
@@ -935,10 +1108,19 @@ export default function (pi: ExtensionAPI) {
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken || pollingPromise) return;
+		try {
+			await acquireProfileLock(ctx);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			updateStatus(ctx, message);
+			ctx.ui.notify(message, "error");
+			return;
+		}
 		pollingController = new AbortController();
-		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
+		pollingPromise = pollLoop(ctx, pollingController.signal).finally(async () => {
 			pollingPromise = undefined;
 			pollingController = undefined;
+			await releaseProfileLock();
 			updateStatus(ctx);
 		});
 		updateStatus(ctx);
@@ -979,9 +1161,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("telegram-setup", {
-		description: "Configure Telegram bot token",
-		handler: async (_args, ctx) => {
-			await promptForConfig(ctx);
+		description: "Configure Telegram bot token for the current or named profile",
+		handler: async (args, ctx) => {
+			const target = await resolveConfigTarget(args, ctx, "setup");
+			await promptForConfig(ctx, target);
 		},
 	});
 
@@ -989,9 +1172,12 @@ export default function (pi: ExtensionAPI) {
 		description: "Show Telegram bridge status",
 		handler: async (_args, ctx) => {
 			const status = [
+				`profile: ${getTargetLabel(configTarget)} (${configTarget.source})`,
+				`config: ${configTarget.path}`,
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
+				`lock: ${activeLockPath ?? "none"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
 			];
@@ -1000,15 +1186,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("telegram-connect", {
-		description: "Start the Telegram bridge in this pi session",
-		handler: async (_args, ctx) => {
-			config = await readConfig();
+		description: "Start the Telegram bridge in this pi session for the current or named profile",
+		handler: async (args, ctx) => {
+			const target = await resolveConfigTarget(args, ctx, "connect");
+			if (target.path !== configTarget.path) {
+				await stopPolling();
+				await loadConfigTarget(target);
+			} else if (!pollingPromise) {
+				await loadConfigTarget(target);
+			}
 			if (!config.botToken) {
-				await promptForConfig(ctx);
+				await promptForConfig(ctx, target);
 				return;
 			}
 			await startPolling(ctx);
-			updateStatus(ctx);
 		},
 	});
 
@@ -1021,9 +1212,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		config = await readConfig();
+		let startError: string | undefined;
+		try {
+			await loadConfigTarget(await resolveConfigTarget("", ctx, "session"));
+		} catch (error) {
+			startError = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(startError, "error");
+		}
 		await mkdir(TEMP_DIR, { recursive: true });
-		updateStatus(ctx);
+		updateStatus(ctx, startError);
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
