@@ -841,7 +841,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
 		}
 	}
 
@@ -1124,7 +1124,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }
