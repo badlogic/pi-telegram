@@ -740,8 +740,9 @@ export default function (pi: ExtensionAPI) {
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
 		const lower = rawText.toLowerCase();
+		const telegramCommand = lower.startsWith("/") ? lower.split(/\s+/, 1)[0].split("@", 1)[0] : lower;
 
-		if (lower === "stop" || lower === "/stop") {
+		if (lower === "stop" || telegramCommand === "/stop") {
 			if (currentAbort) {
 				if (queuedTelegramTurns.length > 0) {
 					preserveQueuedTurnsAsHistory = true;
@@ -755,7 +756,20 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/compact") {
+		if (telegramCommand === "/new") {
+			if (!ctx.isIdle()) {
+				if (queuedTelegramTurns.length > 0) queuedTelegramTurns = [];
+				currentAbort?.();
+				updateStatus(ctx);
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Aborting current turn and starting a fresh pi session…");
+			} else {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Starting a fresh pi session…");
+			}
+			pi.sendUserMessage("/telegram-new-session", { allowCommands: true } as never);
+			return;
+		}
+
+		if (telegramCommand === "/compact") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
 				return;
@@ -773,7 +787,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/status") {
+		if (telegramCommand === "/status") {
 			let totalInput = 0;
 			let totalOutput = 0;
 			let totalCacheRead = 0;
@@ -820,11 +834,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/help" || lower === "/start") {
+		if (telegramCommand === "/help" || telegramCommand === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /new, /status, /compact, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -926,6 +940,12 @@ export default function (pi: ExtensionAPI) {
 				if (signal.aborted) return;
 				if (error instanceof DOMException && error.name === "AbortError") return;
 				const message = error instanceof Error ? error.message : String(error);
+				if (message.includes("Conflict: terminated by other getUpdates request")) {
+					updateStatus(ctx, "waiting for previous Telegram poll to finish");
+					await new Promise((resolve) => setTimeout(resolve, 3000));
+					updateStatus(ctx);
+					continue;
+				}
 				updateStatus(ctx, message);
 				await new Promise((resolve) => setTimeout(resolve, 3000));
 				updateStatus(ctx);
@@ -982,6 +1002,25 @@ export default function (pi: ExtensionAPI) {
 		description: "Configure Telegram bot token",
 		handler: async (_args, ctx) => {
 			await promptForConfig(ctx);
+		},
+	});
+
+	pi.registerCommand("telegram-new-session", {
+		description: "Start a fresh pi session from Telegram",
+		handler: async (_args, ctx) => {
+			await ctx.waitForIdle();
+			const result = await ctx.newSession({
+				parentSession: ctx.sessionManager.getSessionFile(),
+				withSession: async (nextCtx) => {
+					// Delay slightly to ensure any previous session's polling loop has fully terminated on Telegram's side
+					await new Promise((resolve) => setTimeout(resolve, 2000));
+					// Programmatically connect the new session's instance to Telegram
+					await nextCtx.sendUserMessage("/telegram-connect", { allowCommands: true });
+				},
+			});
+			if (result.cancelled) {
+				ctx.ui.notify("Telegram /new was cancelled.", "warning");
+			}
 		},
 	});
 
