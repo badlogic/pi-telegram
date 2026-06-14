@@ -497,8 +497,8 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
+			previewState = undefined;
 			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
-			await clearPreview(chatId);
 			return true;
 		}
 		previewState = undefined;
@@ -1065,6 +1065,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
+		stopTypingLoop();
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
 			await finalizePreview(activeTelegramTurn.chatId);
 		}
