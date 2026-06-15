@@ -91,6 +91,18 @@ The extension:
 - includes local file paths in the prompt
 - forwards inbound images as image inputs to pi
 
+### Send voice messages
+
+If a local Whisper-compatible speech-to-text model is already available, voice/audio messages are transcribed before pi is called.
+
+The extension:
+- sends `Transcribing voice message…` immediately
+- sends the transcript when transcription finishes
+- forwards the transcript to pi instead of asking the LLM to transcribe the audio
+- falls back to the original audio attachment behavior if no local transcriber is found
+
+It detects common Whisper model locations such as `~/.cache/whisper`, `~/.cache/whisper.cpp`, `~/.cache/huggingface/hub`, `~/.pi/agent/models`, `~/models`, and `~/Models`. Set `WHISPER_COMMAND` to override the transcription executable.
+
 ### Ask for files back
 
 If you ask pi for a file or generated artifact, pi should call the `telegram_attach` tool. The extension then sends those files with the next Telegram reply.

@@ -1,4 +1,6 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -128,6 +130,7 @@ interface PendingTelegramTurn {
 	queuedAttachments: QueuedAttachment[];
 	content: Array<TextContent | ImageContent>;
 	historyText: string;
+	transcriptionText?: string;
 }
 
 type ActiveTelegramTurn = PendingTelegramTurn;
@@ -159,6 +162,7 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+const execFileAsync = promisify(execFile);
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -202,6 +206,113 @@ function guessMediaType(path: string): string | undefined {
 
 function isImageMimeType(mimeType: string | undefined): boolean {
 	return mimeType?.toLowerCase().startsWith("image/") ?? false;
+}
+
+function isAudioFile(file: DownloadedTelegramFile): boolean {
+	if (file.mimeType?.toLowerCase().startsWith("audio/")) return true;
+	return [".ogg", ".oga", ".opus", ".mp3", ".wav", ".m4a", ".flac"].includes(extname(file.path).toLowerCase());
+}
+
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await access(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function findExecutable(names: string[]): Promise<string | undefined> {
+	for (const name of names) {
+		if (name.includes("/") && (await pathExists(name))) return name;
+		try {
+			const { stdout } = await execFileAsync("which", [name]);
+			const command = stdout.trim().split("\n")[0];
+			if (command) return command;
+		} catch {
+			// try next
+		}
+	}
+	return undefined;
+}
+
+async function findSpeechModel(): Promise<string | undefined> {
+	const dirs = [
+		process.env.WHISPER_MODEL_DIR,
+		join(homedir(), ".cache", "whisper"),
+		join(homedir(), ".cache", "whisper.cpp"),
+		join(homedir(), ".cache", "huggingface", "hub"),
+		join(homedir(), ".local", "share", "whisper"),
+		join(homedir(), "Library", "Application Support", "whisper.cpp"),
+		join(homedir(), ".pi", "agent", "models"),
+		join(homedir(), "models"),
+		join(homedir(), "Models"),
+	].filter((dir): dir is string => Boolean(dir));
+	const candidates: string[] = [];
+	async function scan(dir: string, depth = 0): Promise<void> {
+		if (depth > 4 || !(await pathExists(dir))) return;
+		for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+			const path = join(dir, entry.name);
+			if (entry.isDirectory()) await scan(path, depth + 1);
+			else if (/\.(pt|gguf)$/i.test(entry.name) || (/\.bin$/i.test(entry.name) && /ggml|whisper\.cpp/i.test(path))) candidates.push(path);
+		}
+	}
+	for (const dir of dirs) await scan(dir);
+	return candidates.sort((a, b) => scoreSpeechModel(b) - scoreSpeechModel(a))[0];
+}
+
+function scoreSpeechModel(path: string): number {
+	const name = basename(path).toLowerCase();
+	const fullPath = path.toLowerCase();
+	let score = 0;
+	if (fullPath.includes("whisper")) score += 20;
+	if (name.includes("base")) score += 10;
+	if (name.includes("small")) score += 8;
+	if (name.includes("tiny")) score += 6;
+	if (name.endsWith(".pt")) score += 4;
+	if (name.endsWith(".bin") || name.endsWith(".gguf")) score += 3;
+	return score;
+}
+
+async function hasLocalTranscriber(): Promise<boolean> {
+	const model = await findSpeechModel();
+	if (!model) return false;
+	const names = extname(model).toLowerCase() === ".pt"
+		? [process.env.WHISPER_COMMAND || "", "whisper"]
+		: [
+			process.env.WHISPER_COMMAND || "",
+			"whisper-cli",
+			"whisper.cpp",
+			"main",
+			join(homedir(), "whisper.cpp", "build", "bin", "whisper-cli"),
+			join(homedir(), "whisper.cpp", "main"),
+		];
+	return Boolean(await findExecutable(names));
+}
+
+async function transcribeAudio(path: string): Promise<string | undefined> {
+	const model = await findSpeechModel();
+	if (!model) return undefined;
+	const ext = extname(model).toLowerCase();
+	if (ext === ".pt") {
+		const whisper = await findExecutable([process.env.WHISPER_COMMAND || "", "whisper"]);
+		if (!whisper) return undefined;
+		const modelName = basename(model, ".pt");
+		const { stdout } = await execFileAsync(whisper, [path, "--model", modelName, "--output_format", "txt", "--output_dir", TEMP_DIR, "--fp16", "False"], { timeout: 10 * 60_000 });
+		return stdout.trim() || (await readFile(join(TEMP_DIR, `${basename(path, extname(path))}.txt`), "utf8").catch(() => "")).trim();
+	}
+	const whisperCpp = await findExecutable([
+		process.env.WHISPER_COMMAND || "",
+		"whisper-cli",
+		"whisper.cpp",
+		"main",
+		join(homedir(), "whisper.cpp", "build", "bin", "whisper-cli"),
+		join(homedir(), "whisper.cpp", "main"),
+	]);
+	if (!whisperCpp) return undefined;
+	const outBase = join(TEMP_DIR, `transcript-${Date.now()}`);
+	const { stdout } = await execFileAsync(whisperCpp, ["-m", model, "-f", path, "-np", "-otxt", "-of", outBase], { timeout: 10 * 60_000 });
+	return (await readFile(`${outBase}.txt`, "utf8").catch(() => stdout)).trim();
 }
 
 function formatTokens(count: number): string {
@@ -692,6 +803,18 @@ export default function (pi: ExtensionAPI) {
 		if (!firstMessage) throw new Error("Missing Telegram message for turn creation");
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).filter(Boolean).join("\n\n");
 		const files = await buildTelegramFiles(messages);
+		const audioFiles = files.filter(isAudioFile);
+		const transcribedAudioPaths = new Set<string>();
+		const transcriptions: string[] = [];
+		for (const file of audioFiles) {
+			const text = await transcribeAudio(file.path).catch(() => undefined);
+			if (!text) continue;
+			transcribedAudioPaths.add(file.path);
+			transcriptions.push(audioFiles.length > 1 ? `${file.fileName}:\n${text}` : text);
+		}
+		const transcriptionText = transcriptions.join("\n\n").trim() || undefined;
+		const effectiveRawText = [rawText, transcriptionText ? `Transcribed voice message:\n${transcriptionText}` : ""].filter(Boolean).join("\n\n");
+		const promptFiles = files.filter((file) => !transcribedAudioPaths.has(file.path));
 		const content: Array<TextContent | ImageContent> = [];
 		let prompt = `${TELEGRAM_PREFIX}`;
 
@@ -703,12 +826,12 @@ export default function (pi: ExtensionAPI) {
 			prompt += `\n\nCurrent Telegram message:`;
 		}
 
-		if (rawText.length > 0) {
-			prompt += historyTurns.length > 0 ? `\n${rawText}` : ` ${rawText}`;
+		if (effectiveRawText.length > 0) {
+			prompt += historyTurns.length > 0 ? `\n${effectiveRawText}` : ` ${effectiveRawText}`;
 		}
-		if (files.length > 0) {
+		if (promptFiles.length > 0) {
 			prompt += `\n\nTelegram attachments were saved locally:`;
-			for (const file of files) {
+			for (const file of promptFiles) {
 				prompt += `\n- ${file.path}`;
 			}
 		}
@@ -731,7 +854,8 @@ export default function (pi: ExtensionAPI) {
 			replyToMessageId: firstMessage.message_id,
 			queuedAttachments: [],
 			content,
-			historyText: formatTelegramHistoryText(rawText, files),
+			historyText: formatTelegramHistoryText(effectiveRawText, promptFiles),
+			transcriptionText,
 		};
 	}
 
@@ -834,9 +958,17 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const shouldTryTranscription = messages.some((message) => message.voice || message.audio) && await hasLocalTranscriber();
+		if (shouldTryTranscription) {
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Transcribing voice message…");
+		}
+
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
+		if (turn.transcriptionText) {
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Transcript:\n${turn.transcriptionText}`);
+		}
 		queuedTelegramTurns.push(turn);
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
