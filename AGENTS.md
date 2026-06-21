@@ -7,24 +7,42 @@ A Telegram DM bridge extension for the [pi](https://pi.dev) AI agent platform. I
 ## Commands
 
 ```bash
-# There is no build step or test runner in this project.
+# There is no build step in this project.
 # The extension is loaded dynamically by pi via the "pi.extensions" field in package.json.
+
+# Run tests
+pnpm test
+
+# Type-check only (if you have the pi peer deps available)
+pnpm typecheck
 
 # Run locally (single-use)
 pi -e .
 
 # Install from local checkout
 pi install .
-
-# Type-check only (if you have the pi peer deps available)
-pnx tsc --noEmit
 ```
 
 The extension has **zero runtime deps** — it uses only Node built-ins (`node:fs/promises`, `node:path`, `node:os`) and the `fetch` API for Telegram Bot API calls. All pi types are peer dependencies loaded at runtime.
 
 ## Code Architecture
 
-A single-file TypeScript extension (`index.ts`) that exports a default function `(pi: ExtensionAPI) => void`.
+A multi-module TypeScript extension that exports a default function `(pi: ExtensionAPI) => void`. The entry point is `index.ts`, which wires together modules from `src/`.
+
+## Module Layout
+
+| Module | Purpose |
+|---|---|
+| `index.ts` | Entry point, factory function, wiring, event handler registrations |
+| `src/types.ts` | All `interface` / `type` declarations |
+| `src/constants.ts` | Configuration constants, system prompt suffix |
+| `src/utils.ts` | Pure utility functions (chunking, formatting, sanitization, file info extraction) |
+| `src/config.ts` | Read and write `~/.pi/agent/telegram.json` |
+| `src/telegram-api.ts` | Telegram Bot API HTTP calls (`callTelegram`, `callTelegramMultipart`, `downloadTelegramFile`) |
+| `src/state.ts` | Runtime state factory (`BridgeState`) |
+| `src/dispatch.ts` | Message dispatch and turn handling |
+| `src/polling.ts` | Long-polling loop and update dispatching |
+| `src/preview.ts` | Streaming preview via draft or edit-message mode |
 
 ### Core Concepts
 
@@ -78,7 +96,7 @@ If the user sends multiple messages while pi is busy, they queue up. When pi fin
 | `message_update` | Throttled streaming preview to Telegram |
 | `agent_end` | Finalize preview, send attachments, dequeue next turn |
 
-### Key Constants (in index.ts)
+### Key Constants (in src/constants.ts)
 
 - `CONFIG_PATH` = `~/.pi/agent/telegram.json`
 - `TEMP_DIR` = `~/.pi/agent/tmp/telegram`

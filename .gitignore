@@ -1,0 +1,21 @@
+node_modules/
+.pnpm-store/
+pnpm-workspace.yaml
+dist/
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Runtime
+*.log
+.env
+.env.local
