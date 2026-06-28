@@ -4,6 +4,9 @@
   "private": false,
   "description": "Telegram DM bridge extension for pi",
   "type": "module",
+  "scripts": {
+    "test": "bun test"
+  },
   "keywords": ["pi-package", "pi", "telegram", "bot", "extension"],
   "license": "MIT",
   "repository": {
@@ -17,10 +20,13 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "dependencies": {
+    "marked": "15.0.12"
+  },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
   }
 }
