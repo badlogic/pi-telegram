@@ -17,10 +17,7 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
-  "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-coding-agent": "*",
+  "dependencies": {
     "@sinclair/typebox": "*"
   }
 }
