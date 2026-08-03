@@ -13,6 +13,13 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	/**
+	 * Start polling automatically when a new session starts (default true).
+	 * Read once at session start; changing it mid-session only takes effect on
+	 * the next session. Set to false to keep new sessions disconnected until
+	 * /telegram-connect is run.
+	 */
+	autoConnectOnNewSession?: boolean;
 }
 
 interface TelegramApiResponse<T> {
@@ -1023,6 +1030,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
+		// Auto-start polling so the bridge is up without needing
+		// /telegram-connect after every pi restart — unless the user opted out
+		// with "autoConnectOnNewSession": false in telegram.json. Only read at
+		// session start; mid-session changes apply on the next session.
+		if (config.botToken && !pollingPromise && config.autoConnectOnNewSession !== false) {
+			await startPolling(ctx);
+		}
 		updateStatus(ctx);
 	});
 
@@ -1042,6 +1056,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event) => {
+		// Only mention the bridge when it is actually connected and could
+		// receive messages. A disconnected session (no auto-connect, manual
+		// disconnect, or no token) gets a clean prompt.
+		if (!pollingPromise) return { systemPrompt: event.systemPrompt };
+
 		const suffix = isTelegramPrompt(event.prompt)
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
 			: SYSTEM_PROMPT_SUFFIX;
