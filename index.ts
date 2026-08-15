@@ -1,4 +1,5 @@
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -340,16 +341,63 @@ export default function (pi: ExtensionAPI) {
 	let configPath = CONFIG_PATH;
 	let pollingController: AbortController | undefined;
 	let pollingPromise: Promise<void> | undefined;
+	let pollingLockPath: string | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
 	let activeTelegramTurn: ActiveTelegramTurn | undefined;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
+	let lastFinalizedTurnKey: string | undefined;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+
+	function getPollingLockPath(): string | undefined {
+		if (!config.botToken) return undefined;
+		const botKey = createHash("sha256").update(config.botToken).digest("hex").slice(0, 20);
+		return join(TEMP_DIR, `poll-${botKey}.lock`);
+	}
+
+	async function claimPollingLock(lockPath: string): Promise<boolean> {
+		try {
+			await mkdir(lockPath);
+			await writeFile(join(lockPath, "owner"), `${process.pid}\n`);
+			pollingLockPath = lockPath;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function acquirePollingLock(): Promise<boolean> {
+		const lockPath = getPollingLockPath();
+		if (!lockPath) return false;
+		await mkdir(TEMP_DIR, { recursive: true });
+		if (await claimPollingLock(lockPath)) return true;
+		try {
+			const owner = Number.parseInt(await readFile(join(lockPath, "owner"), "utf8"), 10);
+			if (!Number.isInteger(owner) || owner <= 0) return false;
+			try {
+				process.kill(owner, 0);
+				return false;
+			} catch {
+				const stalePath = `${lockPath}.stale-${randomUUID()}`;
+				await rename(lockPath, stalePath);
+				await rm(stalePath, { recursive: true, force: true });
+				return await claimPollingLock(lockPath);
+			}
+		} catch {
+			return false;
+		}
+	}
+
+	async function releasePollingLock(): Promise<void> {
+		const lockPath = pollingLockPath;
+		pollingLockPath = undefined;
+		if (lockPath) await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -729,7 +777,6 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
 			ctx.ui.notify("Send /start to your bot in Telegram to pair this extension with your account.", "info");
 			await startPolling(ctx);
-			updateStatus(ctx);
 		} finally {
 			setupInProgress = false;
 		}
@@ -1034,10 +1081,15 @@ export default function (pi: ExtensionAPI) {
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken || pollingPromise) return;
+		if (!(await acquirePollingLock())) {
+			updateStatus(ctx, "another pi session is already polling this bot");
+			return;
+		}
 		pollingController = new AbortController();
-		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
+		pollingPromise = pollLoop(ctx, pollingController.signal).finally(async () => {
 			pollingPromise = undefined;
 			pollingController = undefined;
+			await releasePollingLock();
 			updateStatus(ctx);
 		});
 		updateStatus(ctx);
@@ -1116,7 +1168,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			await startPolling(ctx);
-			updateStatus(ctx);
 		},
 	});
 
@@ -1193,6 +1244,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (event, ctx) => {
 		const turn = activeTelegramTurn;
+		if (turn) {
+			const turnKey = `${turn.chatId}:${turn.replyToMessageId}`;
+			if (lastFinalizedTurnKey === turnKey) return;
+			lastFinalizedTurnKey = turnKey;
+		}
 		currentAbort = undefined;
 		stopTypingLoop();
 		activeTelegramTurn = undefined;
