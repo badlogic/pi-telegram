@@ -45,6 +45,18 @@ The extension stores config in:
 ~/.pi/agent/telegram.json
 ```
 
+### Use different bots in different pi sessions
+
+Set `PI_TELEGRAM_CONFIG` to give each pi process its own configuration file:
+
+```bash
+PI_TELEGRAM_CONFIG="$HOME/.pi/agent/telegram-work.json" pi
+PI_TELEGRAM_CONFIG="$HOME/.pi/agent/telegram-personal.json" pi
+```
+
+Each file can contain a different bot token, allowlist, and update offset. If the
+variable is not set, the default path above is used.
+
 ## Connect a pi session
 
 The Telegram bridge is session-local. Connect it only in the pi session that should own the bot:

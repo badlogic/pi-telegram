@@ -1,5 +1,5 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
@@ -151,7 +151,10 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
+const configuredConfigPath = process.env.PI_TELEGRAM_CONFIG?.trim();
+const CONFIG_PATH = configuredConfigPath
+	? resolve(configuredConfigPath)
+	: join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
