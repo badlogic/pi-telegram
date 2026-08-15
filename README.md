@@ -65,14 +65,20 @@ Check status:
 /telegram-status
 ```
 
-## Pair your Telegram account
+## Pair Telegram accounts
 
 After token setup and `/telegram-connect`:
 
 1. Open the DM with your bot in Telegram
-2. Send `/start`
+2. Send `/start` from the first account
+3. Add additional numeric Telegram user IDs to `~/.pi/agent/telegram.json`:
 
-The first DM user becomes the allowed Telegram user for the bridge. The extension only accepts messages from that user.
+```json
+"allowedUserIds": [530236679, 123456789]
+```
+
+The extension accepts messages from every listed account. Existing configs using
+`allowedUserId` are migrated automatically when the bridge reconnects.
 
 ## Usage
 

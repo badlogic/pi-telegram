@@ -11,6 +11,8 @@ interface TelegramConfig {
 	botToken?: string;
 	botUsername?: string;
 	botId?: number;
+	allowedUserIds?: number[];
+	/** Legacy single-user setting, migrated when the config is read. */
 	allowedUserId?: number;
 	lastUpdateId?: number;
 }
@@ -273,6 +275,19 @@ async function readConfig(): Promise<TelegramConfig> {
 	try {
 		const content = await readFile(CONFIG_PATH, "utf8");
 		const parsed = JSON.parse(content) as TelegramConfig;
+		const allowedUserIds = Array.isArray(parsed.allowedUserIds)
+			? parsed.allowedUserIds.filter((id): id is number => Number.isInteger(id))
+			: parsed.allowedUserId !== undefined
+				? [parsed.allowedUserId]
+				: undefined;
+		if (allowedUserIds !== undefined) {
+			const migrated = { ...parsed, allowedUserIds };
+			delete migrated.allowedUserId;
+			if (parsed.allowedUserId !== undefined || !Array.isArray(parsed.allowedUserIds)) {
+				await writeConfig(migrated);
+			}
+			return migrated;
+		}
 		return parsed;
 	} catch {
 		return {};
@@ -319,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "disconnected")}`);
 			return;
 		}
-		if (!config.allowedUserId) {
+		if (!config.allowedUserIds || config.allowedUserIds.length === 0) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("warning", "awaiting pairing")}`);
 			return;
 		}
@@ -826,8 +841,8 @@ export default function (pi: ExtensionAPI) {
 				firstMessage.message_id,
 				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
 			);
-			if (config.allowedUserId === undefined && firstMessage.from) {
-				config.allowedUserId = firstMessage.from.id;
+			if ((!config.allowedUserIds || config.allowedUserIds.length === 0) && firstMessage.from) {
+				config.allowedUserIds = [firstMessage.from.id];
 				await writeConfig(config);
 				updateStatus(ctx);
 			}
@@ -868,14 +883,14 @@ export default function (pi: ExtensionAPI) {
 		const message = update.message || update.edited_message;
 		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
 
-		if (config.allowedUserId === undefined) {
-			config.allowedUserId = message.from.id;
+		if (!config.allowedUserIds || config.allowedUserIds.length === 0) {
+			config.allowedUserIds = [message.from.id];
 			await writeConfig(config);
 			updateStatus(ctx);
 			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
 		}
 
-		if (message.from.id !== config.allowedUserId) {
+		if (!config.allowedUserIds.includes(message.from.id)) {
 			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
 			return;
 		}
@@ -990,7 +1005,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const status = [
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
-				`allowed user: ${config.allowedUserId ?? "not paired"}`,
+				`allowed users: ${config.allowedUserIds?.join(", ") || "not paired"}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
