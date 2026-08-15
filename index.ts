@@ -316,7 +316,7 @@ async function discoverConfigCandidates(): Promise<TelegramConfigCandidate[]> {
 	try {
 		const entries = await readdir(dirname(DEFAULT_CONFIG_PATH), { withFileTypes: true });
 		const paths = entries
-			.filter((entry) => entry.isFile() && /^telegram.*\\.json$/.test(entry.name))
+			.filter((entry) => entry.isFile() && /^telegram.*\.json$/.test(entry.name))
 			.map((entry) => join(dirname(DEFAULT_CONFIG_PATH), entry.name))
 			.sort();
 		const candidates: TelegramConfigCandidate[] = [];
@@ -360,12 +360,12 @@ export default function (pi: ExtensionAPI) {
 		if (configuredConfigPath || pollingPromise) return true;
 		const candidates = await discoverConfigCandidates();
 		if (candidates.length < 2) return true;
-		const selectedPath = await ctx.ui.select(
+		const selectedLabel = await ctx.ui.select(
 			"Connect Telegram bot",
-			candidates.map((candidate) => ({ label: candidate.label, value: candidate.path })),
+			candidates.map((candidate) => candidate.label),
 		);
-		if (!selectedPath) return false;
-		const selected = candidates.find((candidate) => candidate.path === selectedPath);
+		if (!selectedLabel) return false;
+		const selected = candidates.find((candidate) => candidate.label === selectedLabel);
 		if (!selected) return false;
 		configPath = selected.path;
 		config = selected.config;
