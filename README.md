@@ -55,7 +55,10 @@ PI_TELEGRAM_CONFIG="$HOME/.pi/agent/telegram-personal.json" pi
 ```
 
 Each file can contain a different bot token, allowlist, and update offset. If the
-variable is not set, the default path above is used.
+variable is not set, `/telegram-connect` shows a bot selection menu when it finds
+multiple `telegram*.json` configurations in `~/.pi/agent/`. The menu labels each
+choice with its bot username and configuration filename. Set `PI_TELEGRAM_CONFIG`
+to bypass the menu and always use one specific configuration.
 
 ## Connect a pi session
 

@@ -1,5 +1,5 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join, resolve } from "node:path";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
@@ -152,9 +152,8 @@ interface TelegramMediaGroupState {
 }
 
 const configuredConfigPath = process.env.PI_TELEGRAM_CONFIG?.trim();
-const CONFIG_PATH = configuredConfigPath
-	? resolve(configuredConfigPath)
-	: join(homedir(), ".pi", "agent", "telegram.json");
+const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
+const CONFIG_PATH = configuredConfigPath ? resolve(configuredConfigPath) : DEFAULT_CONFIG_PATH;
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
@@ -272,9 +271,9 @@ function chunkParagraphs(text: string): string[] {
 	return chunks;
 }
 
-async function readConfig(): Promise<TelegramConfig> {
+async function readConfig(configPath = CONFIG_PATH): Promise<TelegramConfig> {
 	try {
-		const content = await readFile(CONFIG_PATH, "utf8");
+		const content = await readFile(configPath, "utf8");
 		const parsed = JSON.parse(content) as TelegramConfig;
 		return parsed;
 	} catch {
@@ -282,13 +281,44 @@ async function readConfig(): Promise<TelegramConfig> {
 	}
 }
 
-async function writeConfig(config: TelegramConfig): Promise<void> {
-	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
+async function writeConfig(config: TelegramConfig, configPath = CONFIG_PATH): Promise<void> {
+	await mkdir(dirname(configPath), { recursive: true });
+	await writeFile(configPath, JSON.stringify(config, null, "\t") + "\n", "utf8");
+}
+
+interface TelegramConfigCandidate {
+	path: string;
+	config: TelegramConfig;
+	label: string;
+}
+
+async function discoverConfigCandidates(): Promise<TelegramConfigCandidate[]> {
+	if (configuredConfigPath) return [];
+	try {
+		const entries = await readdir(dirname(DEFAULT_CONFIG_PATH), { withFileTypes: true });
+		const paths = entries
+			.filter((entry) => entry.isFile() && /^telegram.*\\.json$/.test(entry.name))
+			.map((entry) => join(dirname(DEFAULT_CONFIG_PATH), entry.name))
+			.sort();
+		const candidates: TelegramConfigCandidate[] = [];
+		for (const path of paths) {
+			const candidateConfig = await readConfig(path);
+			if (!candidateConfig.botToken) continue;
+			candidates.push({
+				path,
+				config: candidateConfig,
+				label: candidateConfig.botUsername ? `@${candidateConfig.botUsername} (${basename(path)})` : basename(path),
+			});
+		}
+		return candidates;
+	} catch {
+		return [];
+	}
 }
 
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
+	let configPath = CONFIG_PATH;
 	let pollingController: AbortController | undefined;
 	let pollingPromise: Promise<void> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
@@ -305,6 +335,23 @@ export default function (pi: ExtensionAPI) {
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
 		return nextDraftId;
+	}
+
+	async function selectConfig(ctx: ExtensionContext): Promise<boolean> {
+		if (configuredConfigPath || pollingPromise) return true;
+		const candidates = await discoverConfigCandidates();
+		if (candidates.length < 2) return true;
+		const selectedPath = await ctx.ui.select(
+			"Connect Telegram bot",
+			candidates.map((candidate) => ({ label: candidate.label, value: candidate.path })),
+		);
+		if (!selectedPath) return false;
+		const selected = candidates.find((candidate) => candidate.path === selectedPath);
+		if (!selected) return false;
+		configPath = selected.path;
+		config = selected.config;
+		ctx.ui.notify(`Selected Telegram bot: ${selected.label}`, "info");
+		return true;
 	}
 
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
@@ -331,7 +378,8 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("accent", "processing")}${queued}`);
 			return;
 		}
-		ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
+		const bot = config.botUsername ? ` @${config.botUsername}` : "";
+		ctx.ui.setStatus("telegram", `${label}${bot} ${theme.fg("success", "connected")}`);
 	}
 
 	async function callTelegram<TResponse>(
@@ -658,7 +706,7 @@ export default function (pi: ExtensionAPI) {
 			nextConfig.botId = data.result.id;
 			nextConfig.botUsername = data.result.username;
 			config = nextConfig;
-			await writeConfig(config);
+			await writeConfig(config, configPath);
 			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
 			ctx.ui.notify("Send /start to your bot in Telegram to pair this extension with your account.", "info");
 			await startPolling(ctx);
@@ -831,7 +879,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
-				await writeConfig(config);
+				await writeConfig(config, configPath);
 				updateStatus(ctx);
 			}
 			return;
@@ -873,7 +921,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (config.allowedUserId === undefined) {
 			config.allowedUserId = message.from.id;
-			await writeConfig(config);
+			await writeConfig(config, configPath);
 			updateStatus(ctx);
 			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
 		}
@@ -901,7 +949,7 @@ export default function (pi: ExtensionAPI) {
 				const last = updates.at(-1);
 				if (last) {
 					config.lastUpdateId = last.update_id;
-					await writeConfig(config);
+					await writeConfig(config, configPath);
 				}
 			} catch {
 				// ignore
@@ -922,7 +970,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				for (const update of updates) {
 					config.lastUpdateId = update.update_id;
-					await writeConfig(config);
+					await writeConfig(config, configPath);
 					await handleUpdate(update, ctx);
 				}
 			} catch (error) {
@@ -993,6 +1041,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const status = [
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
+				`config: ${basename(configPath)}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
@@ -1005,8 +1054,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-connect", {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
-			config = await readConfig();
+			if (!(await selectConfig(ctx))) return;
 			if (!config.botToken) {
+				config = await readConfig(configPath);
 				await promptForConfig(ctx);
 				return;
 			}
@@ -1024,7 +1074,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		config = await readConfig();
+		config = await readConfig(configPath);
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
 	});
