@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -290,6 +290,25 @@ interface TelegramConfigCandidate {
 	path: string;
 	config: TelegramConfig;
 	label: string;
+}
+
+function botConfigPath(botUsername: string | undefined, botId: number): string {
+	const identifier = botUsername ?? botId.toString();
+	return join(dirname(DEFAULT_CONFIG_PATH), `telegram-${identifier}.json`);
+}
+
+async function migrateDefaultConfigPath(config: TelegramConfig): Promise<string> {
+	if (configuredConfigPath || !config.botUsername || config.botId === undefined) return DEFAULT_CONFIG_PATH;
+	const targetPath = botConfigPath(config.botUsername, config.botId);
+	if (targetPath === DEFAULT_CONFIG_PATH) return DEFAULT_CONFIG_PATH;
+	try {
+		await stat(targetPath);
+		return DEFAULT_CONFIG_PATH;
+	} catch (error) {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+	}
+	await rename(DEFAULT_CONFIG_PATH, targetPath);
+	return targetPath;
 }
 
 async function discoverConfigCandidates(): Promise<TelegramConfigCandidate[]> {
@@ -716,6 +735,35 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	async function promptForAdditionalBot(ctx: ExtensionContext): Promise<void> {
+		if (!ctx.hasUI || setupInProgress) return;
+		setupInProgress = true;
+		try {
+			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
+			if (!token) return;
+			const response = await fetch(`https://api.telegram.org/bot${token.trim()}/getMe`);
+			const data = (await response.json()) as TelegramApiResponse<TelegramUser>;
+			if (!data.ok || !data.result) {
+				ctx.ui.notify(data.description || "Invalid Telegram bot token", "error");
+				return;
+			}
+			const path = botConfigPath(data.result.username, data.result.id);
+			const existing = await readConfig(path);
+			await writeConfig(
+				{
+					...existing,
+					botToken: token.trim(),
+					botId: data.result.id,
+					botUsername: data.result.username,
+				},
+				path,
+			);
+			ctx.ui.notify(`Added Telegram bot: @${data.result.username ?? data.result.id} (${basename(path)})`, "info");
+		} finally {
+			setupInProgress = false;
+		}
+	}
+
 	async function stopPolling(): Promise<void> {
 		stopTypingLoop();
 		pollingController?.abort();
@@ -1030,9 +1078,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("telegram-setup", {
-		description: "Configure Telegram bot token",
+		description: "Configure the current Telegram bot",
 		handler: async (_args, ctx) => {
 			await promptForConfig(ctx);
+		},
+	});
+
+	pi.registerCommand("telegram-add", {
+		description: "Add a Telegram bot using its token",
+		handler: async (_args, ctx) => {
+			await promptForAdditionalBot(ctx);
 		},
 	});
 
@@ -1075,6 +1130,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig(configPath);
+		if (configPath === DEFAULT_CONFIG_PATH) {
+			configPath = await migrateDefaultConfigPath(config);
+		}
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
 	});
