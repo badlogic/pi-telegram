@@ -345,6 +345,7 @@ export default function (pi: ExtensionAPI) {
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
 	let activeTelegramTurn: ActiveTelegramTurn | undefined;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
+	let typingRequestInFlight = false;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
 	let lastFinalizedTurnKey: string | undefined;
@@ -512,11 +513,14 @@ export default function (pi: ExtensionAPI) {
 		if (typingInterval || targetChatId === undefined) return;
 
 		const sendTyping = async (): Promise<void> => {
+			if (typingRequestInFlight) return;
+			typingRequestInFlight = true;
 			try {
 				await callTelegram("sendChatAction", { chat_id: targetChatId, action: "typing" });
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				updateStatus(ctx, `typing failed: ${message}`);
+			} catch {
+				// Typing indicators are best-effort.
+			} finally {
+				typingRequestInFlight = false;
 			}
 		};
 
