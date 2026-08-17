@@ -991,7 +991,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
 		}
 	}
 
@@ -1295,7 +1295,9 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			// agent_end fires before the agent is fully settled, so the next turn
+			// must be queued as a follow-up rather than sent as a fresh prompt.
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }
