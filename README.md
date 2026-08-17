@@ -45,6 +45,35 @@ The extension stores config in:
 ~/.pi/agent/telegram.json
 ```
 
+### Add and select multiple bots
+
+Run this command once for each additional bot:
+
+```bash
+/telegram-add
+```
+
+Paste the bot token when prompted. The extension calls Telegram's `getMe` API to
+retrieve the bot username, then stores the configuration automatically as:
+
+```text
+~/.pi/agent/telegram-<bot-username>.json
+```
+
+Existing `telegram.json` configurations are renamed automatically on the next
+start after the extension is updated, using their saved bot username.
+
+Run `/telegram-connect` to select a bot for the current pi session. The menu
+labels each choice with its bot username and configuration filename.
+
+For scripts or a fixed session assignment, `PI_TELEGRAM_CONFIG` bypasses the menu:
+
+```bash
+PI_TELEGRAM_CONFIG="$HOME/.pi/agent/telegram-coding_bot.json" pi
+```
+
+Each configuration has its own bot token, allowlist, and update offset.
+
 ## Connect a pi session
 
 The Telegram bridge is session-local. Connect it only in the pi session that should own the bot:
