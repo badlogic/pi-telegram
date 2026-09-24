@@ -1,11 +1,12 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { prepareSpeechText, synthesizeVoiceReply, transcribeVoiceNote, voiceRuntimeAvailable } from "./voice.ts";
 
 interface TelegramConfig {
 	botToken?: string;
@@ -13,6 +14,7 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	voiceAutomationEnabled?: boolean;
 }
 
 interface TelegramApiResponse<T> {
@@ -58,12 +60,14 @@ interface TelegramAudio {
 	file_name?: string;
 	mime_type?: string;
 	file_size?: number;
+	duration?: number;
 }
 
 interface TelegramVoice {
 	file_id: string;
 	mime_type?: string;
 	file_size?: number;
+	duration?: number;
 }
 
 interface TelegramAnimation {
@@ -83,6 +87,9 @@ interface TelegramFileInfo {
 	fileName: string;
 	mimeType?: string;
 	isImage: boolean;
+	fileSize?: number;
+	durationSeconds?: number;
+	speechInput?: boolean;
 }
 
 interface TelegramMessage {
@@ -109,17 +116,24 @@ interface TelegramUpdate {
 
 interface TelegramGetFileResult {
 	file_path: string;
+	file_size?: number;
 }
 
 interface TelegramSentMessage {
 	message_id: number;
 }
 
+interface TelegramBotCommand {
+	command: string;
+	description: string;
+}
+
 interface DownloadedTelegramFile {
-	path: string;
+	path?: string;
 	fileName: string;
 	isImage: boolean;
 	mimeType?: string;
+	transcript?: string;
 }
 
 interface PendingTelegramTurn {
@@ -151,11 +165,20 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
-const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
+const CONFIG_PATH = process.env.PI_TELEGRAM_CONFIG
+	? resolve(process.env.PI_TELEGRAM_CONFIG)
+	: join(homedir(), ".pi", "agent", "telegram.json");
+const TEMP_DIR = process.env.PI_TELEGRAM_TMP_DIR
+	? resolve(process.env.PI_TELEGRAM_TMP_DIR)
+	: join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
+const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_VOICE_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_VOICE_DURATION_SECONDS = 120;
+const MAX_OUTBOUND_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_VOICE_REPLY_BYTES = 5 * 1024 * 1024;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
@@ -280,8 +303,16 @@ async function readConfig(): Promise<TelegramConfig> {
 }
 
 async function writeConfig(config: TelegramConfig): Promise<void> {
-	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
+	await mkdir(dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
+	const tempPath = `${CONFIG_PATH}.${process.pid}.tmp`;
+	try {
+		await writeFile(tempPath, JSON.stringify(config, null, "\t") + "\n", { encoding: "utf8", mode: 0o600 });
+		await chmod(tempPath, 0o600);
+		await rename(tempPath, CONFIG_PATH);
+	} catch (error) {
+		await unlink(tempPath).catch(() => undefined);
+		throw error;
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -297,11 +328,50 @@ export default function (pi: ExtensionAPI) {
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
+	let voiceReplyQueue: Promise<void> = Promise.resolve();
+	let voiceStopping = false;
+	const voiceJobControllers = new Set<AbortController>();
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
 		return nextDraftId;
+	}
+
+	const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+	function buildBotCommands(): TelegramBotCommand[] {
+		return [
+			{ command: "start", description: "Pair this account and show help" },
+			{ command: "help", description: "Show available commands" },
+			{ command: "status", description: "Show model, usage, cost, and context" },
+			{ command: "thinking", description: "Show or set reasoning level (off..max)" },
+			...(isVoiceAutomationAllowed() ? [{ command: "voice", description: "Show or toggle local voice automation" }] : []),
+			{ command: "compact", description: "Compact the session context" },
+			{ command: "stop", description: "Abort the current turn" },
+		];
+	}
+
+	async function registerBotCommands(ctx: ExtensionContext): Promise<void> {
+		if (!config.botToken) return;
+		try {
+			await callTelegram("setMyCommands", { commands: buildBotCommands() });
+		} catch {
+			// Menu registration is best-effort; ignore failures.
+		}
+	}
+
+	function isVoiceAutomationAllowed(): boolean {
+		return !process.env.PI_TELEGRAM_CONFIG || process.env.PI_TELEGRAM_VOICE_ENABLED === "1";
+	}
+
+	function isVoiceAutomationEnabled(): boolean {
+		return isVoiceAutomationAllowed() && (config.voiceAutomationEnabled ?? !process.env.PI_TELEGRAM_CONFIG);
+	}
+
+	async function ensurePrivateTempDir(): Promise<void> {
+		await mkdir(TEMP_DIR, { recursive: true, mode: 0o700 });
+		await chmod(TEMP_DIR, 0o700);
 	}
 
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
@@ -356,15 +426,19 @@ export default function (pi: ExtensionAPI) {
 		fileField: string,
 		filePath: string,
 		fileName: string,
-		options?: { signal?: AbortSignal },
+		options?: { signal?: AbortSignal; contentType?: string; maxBytes?: number },
 	): Promise<TResponse> {
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
 		const form = new FormData();
 		for (const [key, value] of Object.entries(fields)) {
 			form.set(key, value);
 		}
+		const maxBytes = options?.maxBytes ?? MAX_OUTBOUND_FILE_BYTES;
+		const fileStats = await stat(filePath);
+		if (fileStats.size > maxBytes) throw new Error("File exceeds the Telegram upload limit");
 		const buffer = await readFile(filePath);
-		form.set(fileField, new Blob([buffer]), fileName);
+		if (buffer.byteLength > maxBytes) throw new Error("File exceeds the Telegram upload limit");
+		form.set(fileField, new Blob([buffer], { type: options?.contentType ?? "application/octet-stream" }), fileName);
 		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
 			method: "POST",
 			body: form,
@@ -377,16 +451,53 @@ export default function (pi: ExtensionAPI) {
 		return data.result;
 	}
 
-	async function downloadTelegramFile(fileId: string, suggestedName: string): Promise<string> {
+	async function downloadTelegramFile(
+		fileId: string,
+		suggestedName: string,
+		options: { maxBytes?: number; directory?: string; advertisedSize?: number } = {},
+	): Promise<string> {
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
+		const maxBytes = options.maxBytes ?? MAX_TELEGRAM_FILE_BYTES;
+		if (options.advertisedSize !== undefined && options.advertisedSize > maxBytes) {
+			throw new Error("Telegram file exceeds the download limit");
+		}
 		const file = await callTelegram<TelegramGetFileResult>("getFile", { file_id: fileId });
-		await mkdir(TEMP_DIR, { recursive: true });
-		const targetPath = join(TEMP_DIR, `${Date.now()}-${sanitizeFileName(suggestedName)}`);
-		const response = await fetch(`https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`);
-		if (!response.ok) throw new Error(`Failed to download Telegram file: ${response.status}`);
-		const arrayBuffer = await response.arrayBuffer();
-		await writeFile(targetPath, Buffer.from(arrayBuffer));
-		return targetPath;
+		if (file.file_size !== undefined && file.file_size > maxBytes) {
+			throw new Error("Telegram file exceeds the download limit");
+		}
+		const directory = options.directory ?? TEMP_DIR;
+		await mkdir(directory, { recursive: true, mode: 0o700 });
+		await chmod(directory, 0o700);
+		const targetPath = join(directory, `${Date.now()}-${sanitizeFileName(suggestedName)}`);
+		try {
+			const response = await fetch(`https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`);
+			if (!response.ok) throw new Error(`Failed to download Telegram file: ${response.status}`);
+			const contentLength = Number(response.headers.get("content-length"));
+			if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+				await response.body?.cancel();
+				throw new Error("Telegram file exceeds the download limit");
+			}
+			if (!response.body) throw new Error("Telegram file response was empty");
+			const reader = response.body.getReader();
+			const chunks: Uint8Array[] = [];
+			let totalBytes = 0;
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				totalBytes += value.byteLength;
+				if (totalBytes > maxBytes) {
+					await reader.cancel();
+					throw new Error("Telegram file exceeds the download limit");
+				}
+				chunks.push(value);
+			}
+			await writeFile(targetPath, Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))), { mode: 0o600 });
+			await chmod(targetPath, 0o600);
+			return targetPath;
+		} catch (error) {
+			await unlink(targetPath).catch(() => undefined);
+			throw error;
+		}
 	}
 
 	function startTypingLoop(ctx: ExtensionContext, chatId?: number): void {
@@ -540,6 +651,38 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function queueVoiceReply(turn: ActiveTelegramTurn, text: string): void {
+		if (voiceStopping || !isVoiceAutomationEnabled() || !prepareSpeechText(text)) return;
+		voiceReplyQueue = voiceReplyQueue.then(async () => {
+			if (voiceStopping || !isVoiceAutomationEnabled()) return;
+			const controller = new AbortController();
+			voiceJobControllers.add(controller);
+			let generated: Awaited<ReturnType<typeof synthesizeVoiceReply>> | undefined = undefined;
+			try {
+				generated = await synthesizeVoiceReply(text, TEMP_DIR, controller.signal);
+				if (!generated || controller.signal.aborted || !isVoiceAutomationEnabled()) return;
+				await callTelegramMultipart<TelegramSentMessage>(
+					"sendVoice",
+					{
+						chat_id: String(turn.chatId),
+						reply_to_message_id: String(turn.replyToMessageId),
+					},
+					"voice",
+					generated.path,
+					"reply.ogg",
+					{ signal: controller.signal, contentType: "audio/ogg", maxBytes: MAX_VOICE_REPLY_BYTES },
+				);
+			} catch {
+				if (!controller.signal.aborted && isVoiceAutomationEnabled()) {
+					await sendTextReply(turn.chatId, turn.replyToMessageId, "Voice reply wasn't available; the text response is above.").catch(() => undefined);
+				}
+			} finally {
+				if (generated) await rm(generated.directory, { recursive: true, force: true });
+				voiceJobControllers.delete(controller);
+			}
+		}).catch(() => undefined);
+	}
+
 	function extractAssistantText(messages: AgentMessage[]): { text?: string; stopReason?: string; errorMessage?: string } {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i] as unknown as Record<string, unknown>;
@@ -569,6 +712,7 @@ export default function (pi: ExtensionAPI) {
 						fileName: `photo-${message.message_id}.jpg`,
 						mimeType: "image/jpeg",
 						isImage: true,
+						fileSize: photo.file_size,
 					});
 				}
 			}
@@ -579,6 +723,7 @@ export default function (pi: ExtensionAPI) {
 					fileName,
 					mimeType: message.document.mime_type,
 					isImage: isImageMimeType(message.document.mime_type),
+					fileSize: message.document.file_size,
 				});
 			}
 			if (message.video) {
@@ -588,6 +733,7 @@ export default function (pi: ExtensionAPI) {
 					fileName,
 					mimeType: message.video.mime_type,
 					isImage: false,
+					fileSize: message.video.file_size,
 				});
 			}
 			if (message.audio) {
@@ -597,6 +743,9 @@ export default function (pi: ExtensionAPI) {
 					fileName,
 					mimeType: message.audio.mime_type,
 					isImage: false,
+					fileSize: message.audio.file_size,
+					durationSeconds: message.audio.duration,
+					speechInput: true,
 				});
 			}
 			if (message.voice) {
@@ -605,6 +754,9 @@ export default function (pi: ExtensionAPI) {
 					fileName: `voice-${message.message_id}${guessExtensionFromMime(message.voice.mime_type, ".ogg")}`,
 					mimeType: message.voice.mime_type,
 					isImage: false,
+					fileSize: message.voice.file_size,
+					durationSeconds: message.voice.duration,
+					speechInput: true,
 				});
 			}
 			if (message.animation) {
@@ -614,6 +766,7 @@ export default function (pi: ExtensionAPI) {
 					fileName,
 					mimeType: message.animation.mime_type,
 					isImage: false,
+					fileSize: message.animation.file_size,
 				});
 			}
 			if (message.sticker) {
@@ -628,13 +781,57 @@ export default function (pi: ExtensionAPI) {
 		return files;
 	}
 
-	async function buildTelegramFiles(messages: TelegramMessage[]): Promise<DownloadedTelegramFile[]> {
+	async function buildTelegramFiles(
+		messages: TelegramMessage[],
+	): Promise<{ files: DownloadedTelegramFile[]; voiceFailure?: string }> {
 		const downloaded: DownloadedTelegramFile[] = [];
+		const discardDownloaded = async (): Promise<void> => {
+			for (const existing of downloaded) {
+				if (existing.path) await unlink(existing.path).catch(() => undefined);
+			}
+			downloaded.length = 0;
+		};
 		for (const file of collectTelegramFileInfos(messages)) {
-			const path = await downloadTelegramFile(file.file_id, file.fileName);
+			if (file.speechInput && isVoiceAutomationEnabled()) {
+				if (file.durationSeconds === undefined) {
+					await discardDownloaded();
+					return { files: [], voiceFailure: "Please send audio as a Telegram voice note or audio message so its duration can be checked." };
+				}
+				if (file.durationSeconds > MAX_VOICE_DURATION_SECONDS) {
+					await discardDownloaded();
+					return { files: [], voiceFailure: "Voice messages must be 2 minutes or shorter." };
+				}
+				if (file.fileSize !== undefined && file.fileSize > MAX_VOICE_FILE_BYTES) {
+					await discardDownloaded();
+					return { files: [], voiceFailure: "That audio file is too large to transcribe. Please send a smaller voice note." };
+				}
+				let workDirectory: string | undefined;
+				try {
+					workDirectory = await mkdtemp(join(TEMP_DIR, "stt-"));
+					await chmod(workDirectory, 0o700);
+					const path = await downloadTelegramFile(file.file_id, file.fileName, {
+						maxBytes: MAX_VOICE_FILE_BYTES,
+						directory: workDirectory,
+						advertisedSize: file.fileSize,
+					});
+					const transcript = await transcribeVoiceNote(path, workDirectory);
+					downloaded.push({ fileName: file.fileName, isImage: false, mimeType: file.mimeType, transcript });
+				} catch {
+					await discardDownloaded();
+					return { files: [], voiceFailure: "I couldn't transcribe that audio locally. Please try a clear voice note under 2 minutes, or send the message as text." };
+				} finally {
+					if (workDirectory) await rm(workDirectory, { recursive: true, force: true });
+				}
+				continue;
+			}
+
+			const path = await downloadTelegramFile(file.file_id, file.fileName, {
+				maxBytes: MAX_TELEGRAM_FILE_BYTES,
+				advertisedSize: file.fileSize,
+			});
 			downloaded.push({ path, fileName: file.fileName, isImage: file.isImage, mimeType: file.mimeType });
 		}
-		return downloaded;
+		return { files: downloaded };
 	}
 
 	async function promptForConfig(ctx: ExtensionContext): Promise<void> {
@@ -674,24 +871,32 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function formatTelegramHistoryText(rawText: string, files: DownloadedTelegramFile[]): string {
-		let summary = rawText.length > 0 ? rawText : "(no text)";
-		if (files.length > 0) {
-			summary += `\nAttachments:`;
-			for (const file of files) {
-				summary += `\n- ${file.path}`;
-			}
+		const parts = rawText.length > 0 ? [rawText] : [];
+		for (const file of files) {
+			if (file.transcript) parts.push(`Local voice transcript: ${file.transcript}`);
+			else if (file.path) parts.push(`Attachment: ${file.path}`);
 		}
-		return summary;
+		return parts.join("\n") || "(no text)";
 	}
 
 	async function createTelegramTurn(
 		messages: TelegramMessage[],
 		historyTurns: PendingTelegramTurn[] = [],
-	): Promise<PendingTelegramTurn> {
+	): Promise<PendingTelegramTurn | undefined> {
 		const firstMessage = messages[0];
 		if (!firstMessage) throw new Error("Missing Telegram message for turn creation");
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).filter(Boolean).join("\n\n");
-		const files = await buildTelegramFiles(messages);
+		const fileBuild = await buildTelegramFiles(messages);
+		if (fileBuild.voiceFailure) {
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, fileBuild.voiceFailure).catch(() => undefined);
+			return undefined;
+		}
+		const files = fileBuild.files;
+		const transcripts = files.filter((file) => file.transcript).map((file) => file.transcript as string);
+		if (transcripts.length > 0) {
+			const transcriptNotice = transcripts.map((transcript, index) => `Transcript ${index + 1}: ${transcript}`).join("\n\n");
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, transcriptNotice).catch(() => undefined);
+		}
 		const content: Array<TextContent | ImageContent> = [];
 		let prompt = `${TELEGRAM_PREFIX}`;
 
@@ -706,16 +911,20 @@ export default function (pi: ExtensionAPI) {
 		if (rawText.length > 0) {
 			prompt += historyTurns.length > 0 ? `\n${rawText}` : ` ${rawText}`;
 		}
-		if (files.length > 0) {
+		if (transcripts.length > 0) {
+			prompt += `\n\n[Local English speech transcription from Telegram audio. It may be inaccurate; clarify unclear or consequential details.]\n${transcripts.join("\n")}`;
+		}
+		const attachments = files.filter((file) => file.path);
+		if (attachments.length > 0) {
 			prompt += `\n\nTelegram attachments were saved locally:`;
-			for (const file of files) {
+			for (const file of attachments) {
 				prompt += `\n- ${file.path}`;
 			}
 		}
 		content.push({ type: "text", text: prompt });
 
 		for (const file of files) {
-			if (!file.isImage) continue;
+			if (!file.isImage || !file.path) continue;
 			const mediaType = file.mimeType || guessMediaType(file.path);
 			if (!mediaType) continue;
 			const buffer = await readFile(file.path);
@@ -740,6 +949,9 @@ export default function (pi: ExtensionAPI) {
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
 		const lower = rawText.toLowerCase();
+		const commandMatch = lower.match(/^\/(\w+)(?:@\w+)?(?:\s+(.*))?$/);
+		const commandName = commandMatch?.[1] ?? lower;
+		const commandArgs = (commandMatch?.[2] ?? "").trim();
 
 		if (lower === "stop" || lower === "/stop") {
 			if (currentAbort) {
@@ -770,6 +982,66 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
+			return;
+		}
+
+		if (commandName === "thinking") {
+			const current = pi.getThinkingLevel();
+			if (!commandArgs) {
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+				`Reasoning level: ${current}\nSet it with: /thinking <level>\nLevels: ${THINKING_LEVELS.join(", ")}`,
+				);
+				return;
+			}
+			const level = commandArgs.toLowerCase() as ThinkingLevel;
+			if (!THINKING_LEVELS.includes(level)) {
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+				`Unknown level: ${commandArgs}\nLevels: ${THINKING_LEVELS.join(", ")}`,
+				);
+				return;
+			}
+			pi.setThinkingLevel(level);
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Reasoning level set to: ${level}`);
+			return;
+		}
+
+		if (commandName === "voice") {
+			if (!isVoiceAutomationAllowed()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Voice automation is disabled for this Telegram profile.");
+				return;
+			}
+			const action = commandArgs.toLowerCase();
+			if (!action || action === "status") {
+				const state = isVoiceAutomationEnabled() ? "on" : "off";
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					`Voice automation is ${state}. ${state === "on" ? "Incoming audio is transcribed locally; short, safe replies are sent as voice notes." : "Use /voice on to enable local transcription and voice replies."}`,
+				);
+				return;
+			}
+			if (action === "on") {
+				if (!(await voiceRuntimeAvailable())) {
+					await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Local voice tools or models are unavailable; voice automation was not enabled.");
+					return;
+				}
+				config.voiceAutomationEnabled = true;
+				await writeConfig(config);
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Voice automation enabled. Incoming audio will be transcribed locally; short, safe replies will include a voice note. Use /voice off to disable.");
+				return;
+			}
+			if (action === "off") {
+				config.voiceAutomationEnabled = false;
+				await writeConfig(config);
+				for (const controller of voiceJobControllers) controller.abort();
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Voice automation disabled. Text replies continue as usual.");
+				return;
+			}
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Usage: /voice [status|on|off]");
 			return;
 		}
 
@@ -813,6 +1085,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				lines.push("Context: unknown");
 			}
+			lines.push(`Voice: ${isVoiceAutomationEnabled() ? "on" : "off"}`);
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
@@ -824,7 +1097,7 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Type / to see the command menu. Commands: /status, /thinking, /voice, /compact, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -837,6 +1110,13 @@ export default function (pi: ExtensionAPI) {
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
 		const turn = await createTelegramTurn(messages, historyTurns);
+		if (!turn) {
+			if (historyTurns.length > 0) {
+				queuedTelegramTurns.unshift(...historyTurns);
+				preserveQueuedTurnsAsHistory = true;
+			}
+			return;
+		}
 		queuedTelegramTurns.push(turn);
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
@@ -872,6 +1152,7 @@ export default function (pi: ExtensionAPI) {
 			config.allowedUserId = message.from.id;
 			await writeConfig(config);
 			updateStatus(ctx);
+			void registerBotCommands(ctx);
 			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
 		}
 
@@ -994,6 +1275,7 @@ export default function (pi: ExtensionAPI) {
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
+				`voice automation: ${isVoiceAutomationEnabled() ? "on" : "off"}`,
 			];
 			ctx.ui.notify(status.join(" | "), "info");
 		},
@@ -1003,11 +1285,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
 			config = await readConfig();
+			await ensurePrivateTempDir();
 			if (!config.botToken) {
 				await promptForConfig(ctx);
 				return;
 			}
 			await startPolling(ctx);
+			await registerBotCommands(ctx);
 			updateStatus(ctx);
 		},
 	});
@@ -1021,8 +1305,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		voiceStopping = false;
 		config = await readConfig();
-		await mkdir(TEMP_DIR, { recursive: true });
+		await ensurePrivateTempDir();
+		if (process.env.PI_TELEGRAM_AUTOSTART === "1" && config.botToken) {
+			await startPolling(ctx);
+			await registerBotCommands(ctx);
+		} else {
+			void registerBotCommands(ctx);
+		}
 		updateStatus(ctx);
 	});
 
@@ -1038,6 +1329,9 @@ export default function (pi: ExtensionAPI) {
 		activeTelegramTurn = undefined;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
+		voiceStopping = true;
+		for (const controller of voiceJobControllers) controller.abort();
+		await voiceReplyQueue.catch(() => undefined);
 		await stopPolling();
 	});
 
@@ -1119,6 +1413,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		await sendQueuedAttachments(turn);
+		if (finalText) queueVoiceReply(turn, finalText);
 
 		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
 			const nextTurn = queuedTelegramTurns[0];

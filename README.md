@@ -39,11 +39,13 @@ Start pi, then run:
 
 Paste the bot token when prompted.
 
-The extension stores config in:
+By default, the extension stores config in:
 
 ```text
 ~/.pi/agent/telegram.json
 ```
+
+For an isolated Pi process, set `PI_TELEGRAM_CONFIG` and `PI_TELEGRAM_TMP_DIR` to separate paths. The config file is written with owner-only permissions. `PI_TELEGRAM_AUTOSTART=1` starts polling at session startup only when that config already contains a bot token; leave it unset for interactive/manual connections. Use a distinct Telegram bot token per Pi session.
 
 ## Connect a pi session
 
@@ -127,9 +129,15 @@ The extension streams assistant text previews back to Telegram while pi is gener
 
 It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
 
+## Voice notes
+
+Local voice automation is controlled from Telegram with `/voice status`, `/voice on`, and `/voice off`. The default profile enables it; profiles using `PI_TELEGRAM_CONFIG` default to off and must also set `PI_TELEGRAM_VOICE_ENABLED=1` to expose/allow the command. Incoming Telegram voice/audio messages are transcribed locally with whisper.cpp, subject to a 10 MiB file and 2-minute duration limit. Short replies are synthesized locally with Kokoro (`am_michael`) and sent as Telegram voice notes; long or potentially sensitive text is skipped. Text replies remain available.
+
+The runtime uses the locally installed whisper.cpp, Opus tools, Kokoro model/voice, mlx-audio Python environment, and phonemization dependencies. Paths can be overridden with `PI_TELEGRAM_WHISPER_CLI`, `PI_TELEGRAM_WHISPER_MODEL`, `PI_TELEGRAM_OPUSDEC`, `PI_TELEGRAM_OPUSENC`, `PI_TELEGRAM_MLX_PYTHON`, `PI_TELEGRAM_KOKORO_MODEL`, `PI_TELEGRAM_KOKORO_VOICE`, and `PI_TELEGRAM_TTS_PYTHONPATH`. Audio temp directories are owner-only, and downloads are size-bounded.
+
 ## Notes
 
-- Only one pi session should be connected to the bot at a time
+- Only one pi session should poll a given bot; use a separate bot token for each independent Pi session
 - Replies are sent as normal Telegram messages, not quote-replies
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
