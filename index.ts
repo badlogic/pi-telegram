@@ -159,8 +159,10 @@ const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 // Rich messages allow up to 32768 UTF-8 characters, i.e. 8x the plain-text limit.
 const MAX_RICH_MESSAGE_LENGTH = 32768;
-// Tolerate this many rich-message rejections before permanently falling back to plain text.
-const RICH_MESSAGE_FAILURE_LIMIT = 2;
+// Rich messages are only disabled permanently when Telegram says the bot cannot use
+// them at all. Content-specific rejections fall back per message instead, so one
+// unrenderable reply cannot force every later reply back to plain text.
+const RICH_UNAVAILABLE_PATTERN = /not found|unknown method|method not found|not implemented|unsupported/i;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
@@ -275,6 +277,11 @@ function chunkParagraphs(text: string, limit: number = MAX_MESSAGE_LENGTH): stri
 	return chunks;
 }
 
+function isRichUnavailableError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return RICH_UNAVAILABLE_PATTERN.test(message);
+}
+
 async function readConfig(): Promise<TelegramConfig> {
 	try {
 		const content = await readFile(CONFIG_PATH, "utf8");
@@ -307,7 +314,7 @@ export default function (pi: ExtensionAPI) {
 	// but may still reject a final message, and vice versa.
 	let richDraftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let richMessageSupport: "unknown" | "supported" | "unsupported" = "unknown";
-	let richMessageFailures = 0;
+	let lastRichError: string | undefined;
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
@@ -574,12 +581,12 @@ export default function (pi: ExtensionAPI) {
 						rich_message: { markdown: chunk },
 					});
 					richMessageSupport = "supported";
-					richMessageFailures = 0;
+					lastRichError = undefined;
 					lastMessageId = sent.message_id;
 					continue;
-				} catch {
-					richMessageFailures += 1;
-					if (richMessageFailures >= RICH_MESSAGE_FAILURE_LIMIT) richMessageSupport = "unsupported";
+				} catch (error) {
+					lastRichError = error instanceof Error ? error.message : String(error);
+					if (isRichUnavailableError(error)) richMessageSupport = "unsupported";
 				}
 			}
 
@@ -873,6 +880,14 @@ export default function (pi: ExtensionAPI) {
 
 			const usage = ctx.getContextUsage();
 			const lines: string[] = [];
+			const richStatus = !richEnabled()
+				? "off"
+				: richMessageSupport === "unsupported"
+					? "unavailable"
+					: lastRichError
+						? `fallback (${lastRichError})`
+						: "on";
+			lines.push(`Rich: ${richStatus}`);
 			if (ctx.model) {
 				lines.push(`Model: ${ctx.model.provider}/${ctx.model.id}`);
 			}
