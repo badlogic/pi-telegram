@@ -13,6 +13,8 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	/** Render replies as Telegram rich messages (Bot API 10.1+) so Markdown renders natively. Defaults to true. */
+	richMessages?: boolean;
 }
 
 interface TelegramApiResponse<T> {
@@ -138,7 +140,7 @@ interface QueuedAttachment {
 }
 
 interface TelegramPreviewState {
-	mode: "draft" | "message";
+	mode: "rich-draft" | "draft" | "message";
 	draftId?: number;
 	messageId?: number;
 	pendingText: string;
@@ -155,6 +157,10 @@ const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
+// Rich messages allow up to 32768 UTF-8 characters, i.e. 8x the plain-text limit.
+const MAX_RICH_MESSAGE_LENGTH = 32768;
+// Tolerate this many rich-message rejections before permanently falling back to plain text.
+const RICH_MESSAGE_FAILURE_LIMIT = 2;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
@@ -212,8 +218,8 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-function chunkParagraphs(text: string): string[] {
-	if (text.length <= MAX_MESSAGE_LENGTH) return [text];
+function chunkParagraphs(text: string, limit: number = MAX_MESSAGE_LENGTH): string[] {
+	if (text.length <= limit) return [text];
 
 	const normalized = text.replace(/\r\n/g, "\n");
 	const paragraphs = normalized.split(/\n\n+/);
@@ -226,13 +232,13 @@ function chunkParagraphs(text: string): string[] {
 	};
 
 	const splitLongBlock = (block: string): string[] => {
-		if (block.length <= MAX_MESSAGE_LENGTH) return [block];
+		if (block.length <= limit) return [block];
 		const lines = block.split("\n");
 		const lineChunks: string[] = [];
 		let lineCurrent = "";
 		for (const line of lines) {
 			const candidate = lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= limit) {
 				lineCurrent = candidate;
 				continue;
 			}
@@ -240,12 +246,12 @@ function chunkParagraphs(text: string): string[] {
 				lineChunks.push(lineCurrent);
 				lineCurrent = "";
 			}
-			if (line.length <= MAX_MESSAGE_LENGTH) {
+			if (line.length <= limit) {
 				lineCurrent = line;
 				continue;
 			}
-			for (let i = 0; i < line.length; i += MAX_MESSAGE_LENGTH) {
-				lineChunks.push(line.slice(i, i + MAX_MESSAGE_LENGTH));
+			for (let i = 0; i < line.length; i += limit) {
+				lineChunks.push(line.slice(i, i + limit));
 			}
 		}
 		if (lineCurrent.length > 0) lineChunks.push(lineCurrent);
@@ -257,7 +263,7 @@ function chunkParagraphs(text: string): string[] {
 		const parts = splitLongBlock(paragraph);
 		for (const part of parts) {
 			const candidate = current.length === 0 ? part : `${current}\n\n${part}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= limit) {
 				current = candidate;
 			} else {
 				flushCurrent();
@@ -296,8 +302,26 @@ export default function (pi: ExtensionAPI) {
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	// Rich drafts drive the live streaming preview; rich messages drive persisted replies.
+	// They are tracked separately because Telegram tolerates partial Markdown in drafts
+	// but may still reject a final message, and vice versa.
+	let richDraftSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	let richMessageSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	let richMessageFailures = 0;
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+
+	function richEnabled(): boolean {
+		return config.richMessages !== false;
+	}
+
+	/**
+	 * Longest reply that can be finalized in place from the streamed preview instead of
+	 * being cleared and re-sent. Rich messages lift this to 32768 characters.
+	 */
+	function maxInPlaceReplyLength(): number {
+		return richEnabled() && richMessageSupport !== "unsupported" ? MAX_RICH_MESSAGE_LENGTH : MAX_MESSAGE_LENGTH;
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -444,6 +468,8 @@ export default function (pi: ExtensionAPI) {
 				// ignore
 			}
 		}
+		// Rich drafts cannot be dismissed the same way: Telegram rejects empty Markdown with
+		// RICH_MESSAGE_MARKDOWN_INVALID. They expire on their own after ~30 seconds.
 	}
 
 	async function flushPreview(chatId: number): Promise<void> {
@@ -452,19 +478,44 @@ export default function (pi: ExtensionAPI) {
 		state.flushTimer = undefined;
 		const text = state.pendingText.trim();
 		if (!text || text === state.lastSentText) return;
+
+		// Prefer rich drafts so the live preview renders Markdown too. Telegram renders
+		// partial/incomplete Markdown while streaming without erroring.
+		if (richEnabled() && richDraftSupport !== "unsupported") {
+			const draftId =
+				state.mode === "rich-draft" && state.draftId !== undefined ? state.draftId : allocateDraftId();
+			const richText = text.length > MAX_RICH_MESSAGE_LENGTH ? text.slice(0, MAX_RICH_MESSAGE_LENGTH) : text;
+			try {
+				await callTelegram("sendRichMessageDraft", {
+					chat_id: chatId,
+					draft_id: draftId,
+					rich_message: { markdown: richText },
+				});
+				richDraftSupport = "supported";
+				state.mode = "rich-draft";
+				state.draftId = draftId;
+				state.lastSentText = text;
+				return;
+			} catch {
+				richDraftSupport = "unsupported";
+				state.draftId = undefined;
+			}
+		}
+
 		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
 
 		if (draftSupport !== "unsupported") {
-			const draftId = state.draftId ?? allocateDraftId();
-			state.draftId = draftId;
+			const draftId = state.mode === "draft" && state.draftId !== undefined ? state.draftId : allocateDraftId();
 			try {
 				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
 				draftSupport = "supported";
 				state.mode = "draft";
-				state.lastSentText = truncated;
+				state.draftId = draftId;
+				state.lastSentText = text;
 				return;
 			} catch {
 				draftSupport = "unsupported";
+				state.draftId = undefined;
 			}
 		}
 
@@ -472,12 +523,12 @@ export default function (pi: ExtensionAPI) {
 			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
 			state.messageId = sent.message_id;
 			state.mode = "message";
-			state.lastSentText = truncated;
+			state.lastSentText = text;
 			return;
 		}
 		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
 		state.mode = "message";
-		state.lastSentText = truncated;
+		state.lastSentText = text;
 	}
 
 	function schedulePreviewFlush(chatId: number): void {
@@ -496,8 +547,8 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(chatId);
 			return false;
 		}
-		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+		if (state.mode === "rich-draft" || state.mode === "draft") {
+			await sendRichOrPlainText(chatId, finalText);
 			await clearPreview(chatId);
 			return true;
 		}
@@ -505,17 +556,48 @@ export default function (pi: ExtensionAPI) {
 		return state.messageId !== undefined;
 	}
 
-	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
+	/**
+	 * Sends text, preferring Telegram rich messages (Bot API 10.1+) so Markdown renders
+	 * natively. Falls back to plain messages when rich messages are unavailable, so a
+	 * reply is never dropped.
+	 */
+	async function sendRichOrPlainText(chatId: number, text: string): Promise<number | undefined> {
+		const richUsable = richEnabled() && richMessageSupport !== "unsupported";
+		const chunks = chunkParagraphs(text, richUsable ? MAX_RICH_MESSAGE_LENGTH : MAX_MESSAGE_LENGTH);
 		let lastMessageId: number | undefined;
+
 		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
-			lastMessageId = sent.message_id;
+			if (richEnabled() && richMessageSupport !== "unsupported") {
+				try {
+					const sent = await callTelegram<TelegramSentMessage>("sendRichMessage", {
+						chat_id: chatId,
+						rich_message: { markdown: chunk },
+					});
+					richMessageSupport = "supported";
+					richMessageFailures = 0;
+					lastMessageId = sent.message_id;
+					continue;
+				} catch {
+					richMessageFailures += 1;
+					if (richMessageFailures >= RICH_MESSAGE_FAILURE_LIMIT) richMessageSupport = "unsupported";
+				}
+			}
+
+			// A chunk sized for rich messages may exceed the plain-text limit, so re-split it.
+			for (const plainChunk of chunk.length > MAX_MESSAGE_LENGTH ? chunkParagraphs(chunk) : [chunk]) {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text: plainChunk,
+				});
+				lastMessageId = sent.message_id;
+			}
 		}
+
 		return lastMessageId;
+	}
+
+	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
+		return sendRichOrPlainText(chatId, text);
 	}
 
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
@@ -1104,7 +1186,7 @@ export default function (pi: ExtensionAPI) {
 			previewState.pendingText = finalText ?? previewState.pendingText;
 		}
 
-		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
+		if (finalText && finalText.length <= maxInPlaceReplyLength()) {
 			const finalized = await finalizePreview(turn.chatId);
 			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
 				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
