@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
@@ -15,6 +16,12 @@ interface TelegramConfig {
 	lastUpdateId?: number;
 	/** Render replies as Telegram rich messages (Bot API 10.1+) so Markdown renders natively. Defaults to true. */
 	richMessages?: boolean;
+	/** Transcribe inbound Telegram voice notes to text. Defaults to true. */
+	voiceTranscription?: boolean;
+	/** MLX Whisper model repo used for voice transcription. */
+	voiceModel?: string;
+	/** Language hint for voice transcription; "auto" lets Whisper detect it. Defaults to "auto". */
+	voiceLanguage?: string;
 }
 
 interface TelegramApiResponse<T> {
@@ -85,6 +92,7 @@ interface TelegramFileInfo {
 	fileName: string;
 	mimeType?: string;
 	isImage: boolean;
+	isVoice?: boolean;
 }
 
 interface TelegramMessage {
@@ -121,6 +129,7 @@ interface DownloadedTelegramFile {
 	path: string;
 	fileName: string;
 	isImage: boolean;
+	isVoice?: boolean;
 	mimeType?: string;
 }
 
@@ -139,6 +148,13 @@ interface QueuedAttachment {
 	fileName: string;
 }
 
+/**
+ * Raised when the transcription toolchain itself cannot run (`uv` or the interpreter is
+ * missing). Only this permanently disables voice transcription; a clip that merely fails
+ * to decode stays a per-message problem.
+ */
+class VoiceToolingUnavailableError extends Error {}
+
 interface TelegramPreviewState {
 	mode: "rich-draft" | "draft" | "message";
 	draftId?: number;
@@ -152,6 +168,82 @@ interface TelegramMediaGroupState {
 	messages: TelegramMessage[];
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
+
+const VOICE_TRANSCRIBE_TIMEOUT_MS = 120_000;
+const DEFAULT_VOICE_MODEL = "mlx-community/whisper-small-mlx";
+// Whisper renders Chinese as Traditional by default; this biases it to Simplified.
+const SIMPLIFIED_CHINESE_PROMPT = "以下是普通话的句子。";
+
+// Piped to `uv run ... python -` on stdin, so the extension stays a single file and we
+// never have to resolve a sibling script path through the extension loader.
+const VOICE_TRANSCRIBE_SCRIPT = `
+import json
+import os
+import sys
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def fail(message):
+    print(json.dumps({"error": message}, ensure_ascii=False))
+    sys.exit(1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        fail("usage: transcribe <audio-path> [model] [language]")
+    path = sys.argv[1]
+    model = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "mlx-community/whisper-small-mlx"
+    language = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "auto"
+
+    try:
+        import av
+        import mlx_whisper
+        import numpy as np
+    except Exception as exc:
+        fail("missing python dependency: " + str(exc))
+
+    # Decode with PyAV, which bundles its own FFmpeg libraries, so no system
+    # ffmpeg binary is required to read Telegram's Ogg/Opus voice notes.
+    try:
+        container = av.open(path)
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
+        blocks = []
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                blocks.append(resampled.to_ndarray())
+        container.close()
+    except Exception as exc:
+        fail("could not decode audio: " + str(exc))
+
+    if not blocks:
+        fail("no audio samples decoded")
+
+    audio = np.concatenate(blocks, axis=1).flatten().astype(np.float32)
+
+    options = {"path_or_hf_repo": model}
+    if language != "auto":
+        options["language"] = language
+    if language == "auto" or language.lower().startswith("zh"):
+        options["initial_prompt"] = ${JSON.stringify(SIMPLIFIED_CHINESE_PROMPT)}
+
+    try:
+        result = mlx_whisper.transcribe(audio, **options)
+    except Exception as exc:
+        fail("transcription failed: " + str(exc))
+
+    print(json.dumps({
+        "text": (result.get("text") or "").strip(),
+        "language": result.get("language"),
+        "durationSeconds": round(float(audio.shape[0]) / 16000.0, 2),
+    }, ensure_ascii=False))
+
+
+main()
+`;
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
@@ -315,11 +407,144 @@ export default function (pi: ExtensionAPI) {
 	let richDraftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let richMessageSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let lastRichError: string | undefined;
+	// Probed lazily on the first voice note so a missing `uv` never slows startup.
+	let voiceToolingSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 
 	function richEnabled(): boolean {
 		return config.richMessages !== false;
+	}
+
+	function voiceEnabled(): boolean {
+		return config.voiceTranscription !== false;
+	}
+
+	/** Prefer the usual uv install location, then fall back to PATH lookup by spawn. */
+	async function uvBinary(): Promise<string> {
+		const local = join(homedir(), ".local", "bin", "uv");
+		try {
+			await stat(local);
+			return local;
+		} catch {
+			return "uv";
+		}
+	}
+
+	interface VoiceTranscript {
+		text: string;
+		language?: string;
+		durationSeconds?: number;
+	}
+
+	/**
+	 * Transcribes one audio file by piping the embedded Python script to `uv run`, which
+	 * resolves MLX Whisper and PyAV in a cached throwaway environment.
+	 */
+	async function transcribeVoice(audioPath: string): Promise<VoiceTranscript> {
+		const uv = await uvBinary();
+		const model = config.voiceModel?.trim() || DEFAULT_VOICE_MODEL;
+		const language = config.voiceLanguage?.trim() || "auto";
+		const child = spawn(
+			uv,
+			["run", "--quiet", "--with", "mlx-whisper", "--with", "av", "--with", "numpy", "python", "-", audioPath, model, language],
+			{ stdio: ["pipe", "pipe", "pipe"] },
+		);
+
+		const outcome = await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }>(
+			(resolve) => {
+				let stdout = "";
+				let stderr = "";
+				let settled = false;
+				let timedOut = false;
+				const finish = (code: number | null): void => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					resolve({ code, stdout, stderr, timedOut });
+				};
+				const timer = setTimeout(() => {
+					timedOut = true;
+					child.kill("SIGKILL");
+				}, VOICE_TRANSCRIBE_TIMEOUT_MS);
+				child.stdout?.on("data", (chunk) => {
+					stdout += chunk.toString();
+				});
+				child.stderr?.on("data", (chunk) => {
+					stderr += chunk.toString();
+				});
+				child.on("error", (error) => {
+					stderr += error.message;
+					finish(-1);
+				});
+				child.on("close", (code) => finish(code));
+				child.stdin?.end(VOICE_TRANSCRIBE_SCRIPT);
+			},
+		);
+
+		if (outcome.timedOut) throw new Error(`timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS / 1000}s`);
+
+		// The script prints exactly one JSON object as its last stdout line; anything before
+		// it is third-party noise from the Python environment.
+		const lastLine = outcome.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+		let parsed: { text?: string; error?: string; language?: string; durationSeconds?: number } | undefined;
+		try {
+			parsed = JSON.parse(lastLine);
+		} catch {
+			parsed = undefined;
+		}
+
+		if (parsed?.error) throw new Error(parsed.error);
+		if (!parsed || typeof parsed.text !== "string") {
+			const detail = (outcome.stderr || outcome.stdout).trim().split("\n").slice(-2).join(" ").slice(0, 200);
+			if (/ENOENT/.test(outcome.stderr)) {
+				throw new VoiceToolingUnavailableError(detail || "uv is not available");
+			}
+			throw new Error(detail || `transcription process exited with code ${outcome.code}`);
+		}
+
+		return { text: parsed.text, language: parsed.language, durationSeconds: parsed.durationSeconds };
+	}
+
+	/** Keeps Telegram's "typing…" indicator alive for slow work before a turn is queued. */
+	async function withTypingIndicator<T>(chatId: number, work: () => Promise<T>): Promise<T> {
+		const tick = (): void => {
+			void callTelegram("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => undefined);
+		};
+		tick();
+		const timer = setInterval(tick, 4000);
+		try {
+			return await work();
+		} finally {
+			clearInterval(timer);
+		}
+	}
+
+	async function transcribeVoiceNotes(chatId: number, files: DownloadedTelegramFile[]): Promise<string[]> {
+		const notes: string[] = [];
+		const voiceFiles = files.filter((file) => file.isVoice);
+		if (voiceFiles.length === 0) return notes;
+		if (!voiceEnabled()) return notes;
+
+		await withTypingIndicator(chatId, async () => {
+			for (const file of voiceFiles) {
+				if (voiceToolingSupport === "unsupported") {
+					notes.push("Voice message (transcription unavailable in this environment).");
+					continue;
+				}
+				try {
+					const transcript = await transcribeVoice(file.path);
+					voiceToolingSupport = "supported";
+					notes.push(transcript.text.length > 0 ? `Voice message transcript: ${transcript.text}` : "Voice message (transcribed as empty audio).");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					if (error instanceof VoiceToolingUnavailableError) voiceToolingSupport = "unsupported";
+					notes.push(`Voice message (transcription failed: ${message.slice(0, 200)}).`);
+				}
+			}
+		});
+
+		return notes;
 	}
 
 	/**
@@ -694,6 +919,7 @@ export default function (pi: ExtensionAPI) {
 					fileName: `voice-${message.message_id}${guessExtensionFromMime(message.voice.mime_type, ".ogg")}`,
 					mimeType: message.voice.mime_type,
 					isImage: false,
+					isVoice: true,
 				});
 			}
 			if (message.animation) {
@@ -721,7 +947,7 @@ export default function (pi: ExtensionAPI) {
 		const downloaded: DownloadedTelegramFile[] = [];
 		for (const file of collectTelegramFileInfos(messages)) {
 			const path = await downloadTelegramFile(file.file_id, file.fileName);
-			downloaded.push({ path, fileName: file.fileName, isImage: file.isImage, mimeType: file.mimeType });
+			downloaded.push({ path, fileName: file.fileName, isImage: file.isImage, isVoice: file.isVoice, mimeType: file.mimeType });
 		}
 		return downloaded;
 	}
@@ -781,6 +1007,7 @@ export default function (pi: ExtensionAPI) {
 		if (!firstMessage) throw new Error("Missing Telegram message for turn creation");
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).filter(Boolean).join("\n\n");
 		const files = await buildTelegramFiles(messages);
+		const voiceNotes = await transcribeVoiceNotes(firstMessage.chat.id, files);
 		const content: Array<TextContent | ImageContent> = [];
 		let prompt = `${TELEGRAM_PREFIX}`;
 
@@ -794,6 +1021,9 @@ export default function (pi: ExtensionAPI) {
 
 		if (rawText.length > 0) {
 			prompt += historyTurns.length > 0 ? `\n${rawText}` : ` ${rawText}`;
+		}
+		for (const note of voiceNotes) {
+			prompt += `\n\n${note}`;
 		}
 		if (files.length > 0) {
 			prompt += `\n\nTelegram attachments were saved locally:`;
