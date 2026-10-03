@@ -8,6 +8,8 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
+import { markdownToTelegramHtml, telegramVisibleLength } from "./markdown.ts";
+
 interface TelegramConfig {
 	botToken?: string;
 	botUsername?: string;
@@ -739,7 +741,7 @@ export default function (pi: ExtensionAPI) {
 		if (draftSupport !== "unsupported") {
 			const draftId = state.mode === "draft" && state.draftId !== undefined ? state.draftId : allocateDraftId();
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				await sendMarkdownHtml("sendMessageDraft", { chat_id: chatId, draft_id: draftId }, truncated);
 				draftSupport = "supported";
 				state.mode = "draft";
 				state.draftId = draftId;
@@ -752,13 +754,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+			const sent = await sendMarkdownHtml<TelegramSentMessage>("sendMessage", { chat_id: chatId }, truncated);
 			state.messageId = sent.message_id;
 			state.mode = "message";
 			state.lastSentText = text;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		await sendMarkdownHtml("editMessageText", { chat_id: chatId, message_id: state.messageId }, truncated);
 		state.mode = "message";
 		state.lastSentText = text;
 	}
@@ -789,9 +791,51 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Sends text with `parse_mode: "HTML"` after converting Markdown. If Telegram rejects
+	 * the message for any reason it is retried without formatting: a formatting bug must
+	 * never cost the user a reply. The plain attempt's error propagates, so the callers
+	 * that probe for capabilities still see the real reason a method is unavailable.
+	 */
+	async function sendMarkdownHtml<TResponse>(
+		method: string,
+		body: Record<string, unknown>,
+		markdown: string,
+	): Promise<TResponse> {
+		try {
+			return await callTelegram<TResponse>(method, {
+				...body,
+				text: markdownToTelegramHtml(markdown),
+				parse_mode: "HTML",
+			});
+		} catch {
+			return await callTelegram<TResponse>(method, { ...body, text: markdown });
+		}
+	}
+
+	/**
+	 * Sends one Markdown chunk as a new message. Telegram measures the text after entity
+	 * parsing, and aligned table padding can make a converted chunk wider than its
+	 * Markdown source, so a chunk that would not fit is halved and retried instead of
+	 * being rejected by the API.
+	 */
+	async function sendMarkdownChunk(chatId: number, markdown: string, depth = 0): Promise<number | undefined> {
+		const fits = telegramVisibleLength(markdownToTelegramHtml(markdown)) <= MAX_MESSAGE_LENGTH;
+		if (!fits && markdown.length > 1 && depth < 4) {
+			let lastMessageId: number | undefined;
+			const half = Math.max(1, Math.ceil(markdown.length / 2));
+			for (const part of chunkParagraphs(markdown, half)) {
+				lastMessageId = (await sendMarkdownChunk(chatId, part, depth + 1)) ?? lastMessageId;
+			}
+			return lastMessageId;
+		}
+		const sent = await sendMarkdownHtml<TelegramSentMessage>("sendMessage", { chat_id: chatId }, markdown);
+		return sent.message_id;
+	}
+
+	/**
 	 * Sends text, preferring Telegram rich messages (Bot API 10.1+) so Markdown renders
-	 * natively. Falls back to plain messages when rich messages are unavailable, so a
-	 * reply is never dropped.
+	 * natively. Falls back to Markdown converted to Telegram HTML, and finally to plain
+	 * text when even that is rejected, so a reply is never dropped.
 	 */
 	async function sendRichOrPlainText(chatId: number, text: string): Promise<number | undefined> {
 		const richUsable = richEnabled() && richMessageSupport !== "unsupported";
@@ -817,11 +861,7 @@ export default function (pi: ExtensionAPI) {
 
 			// A chunk sized for rich messages may exceed the plain-text limit, so re-split it.
 			for (const plainChunk of chunk.length > MAX_MESSAGE_LENGTH ? chunkParagraphs(chunk) : [chunk]) {
-				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-					chat_id: chatId,
-					text: plainChunk,
-				});
-				lastMessageId = sent.message_id;
+				lastMessageId = (await sendMarkdownChunk(chatId, plainChunk)) ?? lastMessageId;
 			}
 		}
 

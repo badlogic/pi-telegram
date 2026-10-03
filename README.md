@@ -125,14 +125,37 @@ If you send more Telegram messages while pi is busy, they are queued and process
 
 The extension streams assistant text previews back to Telegram while pi is generating.
 
-It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
+It tries Telegram draft streaming first with `sendRichMessageDraft` (or `sendMessageDraft`). If
+that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
+
+## Formatting
+
+Replies render as Markdown through three tiers, each of which degrades instead of failing:
+
+1. **Rich messages** (`sendRichMessage`, Bot API 10.1+). Markdown renders natively, up to 32768 characters.
+2. **HTML fallback.** When rich messages are unavailable, or `richMessages` is `false`, replies are converted
+to Telegram's `parse_mode: "HTML"` with `markdown.ts`: bold, italic, strikethrough, inline code, fenced code,
+links, headings, blockquotes, lists and pipe tables. Tables become aligned monospace blocks because Telegram
+has no table tags.
+3. **Plain text.** If Telegram still rejects the message, it is retried unformatted, so a formatting bug can
+never cost you a reply.
+
+Set `richMessages: false` in `~/.pi/agent/telegram.json` to force the HTML fallback path.
 
 ## Notes
 
 - Only one pi session should be connected to the bot at a time
 - Replies are sent as normal Telegram messages, not quote-replies
-- Long replies are split below Telegram's 4096 character limit
+- Long replies are split below Telegram's limit (32768 characters for rich messages, 4096 otherwise)
 - Outbound files are sent via `telegram_attach`
+
+## Development
+
+```bash
+npm test
+```
+
+`markdown.ts` is pure and has no pi dependencies, so it can be run and tested directly with Node.
 
 ## License
 
