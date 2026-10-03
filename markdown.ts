@@ -70,6 +70,12 @@ function sanitizeLanguage(language: string): string | undefined {
 /**
  * Approximate terminal width of a string, counting East Asian wide and emoji
  * code points as two columns. Used to align table cells inside `<pre>`.
+ *
+ * Both this heuristic and the alignment it feeds are deliberately imperfect; see
+ * "Table rendering limits" in the README. Telegram wraps `<pre>` lines at the bubble
+ * width, so alignment only holds for narrow tables, and clients disagree about how wide
+ * a ZWJ emoji sequence is. The `<pre>` block is kept anyway: it groups the table and
+ * gives clients a copy button.
  */
 function displayWidth(text: string): number {
 	let width = 0;
