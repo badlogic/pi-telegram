@@ -121,6 +121,16 @@ That aborts the active pi turn.
 
 If you send more Telegram messages while pi is busy, they are queued and processed in order.
 
+### Start a fresh session
+
+Send `/new` to start a fresh Pi session while preserving the current session as its parent. The command is accepted only when Pi is idle and no Telegram turns are queued; otherwise it replies without discarding work.
+
+### Common Pi controls
+
+- `/model` first opens a provider list, then that provider's models; selecting one switches models when Pi is idle. Large lists are paginated. You can also use `/model <provider>/<model-id>` directly.
+- `/think` shows the current thinking level; `/think <off|minimal|low|medium|high|xhigh>` changes it when Pi is idle.
+- `/context` shows context-window usage.
+
 ## Streaming
 
 The extension streams assistant text previews back to Telegram while pi is generating.

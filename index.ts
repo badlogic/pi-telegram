@@ -13,6 +13,8 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	reconnectAfterSessionSwitch?: boolean;
+	currentSessionFile?: string;
 }
 
 interface TelegramApiResponse<T> {
@@ -101,10 +103,18 @@ interface TelegramMessage {
 	sticker?: TelegramSticker;
 }
 
+interface TelegramCallbackQuery {
+	id: string;
+	from: TelegramUser;
+	message?: TelegramMessage;
+	data?: string;
+}
+
 interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	edited_message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
 }
 
 interface TelegramGetFileResult {
@@ -293,6 +303,7 @@ export default function (pi: ExtensionAPI) {
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
+	let telegramSessionSwitchPending = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
@@ -498,7 +509,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (state.mode === "draft") {
 			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
-			await clearPreview(chatId);
+			// The final message replaces the active draft; an empty draft renders as a blank bubble.
+			previewState = undefined;
 			return true;
 		}
 		previewState = undefined;
@@ -735,13 +747,179 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	function getSelectableModels(ctx: ExtensionContext): ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]> {
+		return [...ctx.modelRegistry.getAvailable()].sort((left, right) => {
+			const providerComparison = left.provider.localeCompare(right.provider);
+			return providerComparison || left.id.localeCompare(right.id);
+		});
+	}
+
+	function getSelectableProviders(models: ReturnType<typeof getSelectableModels>): string[] {
+		return [...new Set(models.map((model) => model.provider))].sort((left, right) => left.localeCompare(right));
+	}
+
+	function buildProviderKeyboard(ctx: ExtensionContext, providers: string[], page: number) {
+		const pageSize = 8;
+		const start = page * pageSize;
+		const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+		for (let index = start; index < Math.min(start + pageSize, providers.length); index += 2) {
+			const row = [index, index + 1]
+				.filter((providerIndex) => providerIndex < providers.length && providerIndex < start + pageSize)
+				.map((providerIndex) => {
+					const provider = providers[providerIndex]!;
+					const label = `${ctx.model?.provider === provider ? "✓ " : ""}${provider}`;
+					return { text: label.length > 64 ? `${label.slice(0, 63)}…` : label, callback_data: `model:provider:${providerIndex}` };
+				});
+			rows.push(row);
+		}
+		const pageCount = Math.ceil(providers.length / pageSize);
+		if (pageCount > 1) {
+			const navigation: Array<{ text: string; callback_data: string }> = [];
+			if (page > 0) navigation.push({ text: "‹ Previous", callback_data: `model:providers:${page - 1}` });
+			if (page + 1 < pageCount) navigation.push({ text: "Next ›", callback_data: `model:providers:${page + 1}` });
+			rows.push(navigation);
+		}
+		return { inline_keyboard: rows };
+	}
+
+	function buildModelKeyboard(ctx: ExtensionContext, providerIndex: number, models: ReturnType<typeof getSelectableModels>, page: number) {
+		const pageSize = 8;
+		const start = page * pageSize;
+		const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+		for (let index = start; index < Math.min(start + pageSize, models.length); index += 2) {
+			const row = [index, index + 1]
+				.filter((modelIndex) => modelIndex < models.length && modelIndex < start + pageSize)
+				.map((modelIndex) => {
+					const model = models[modelIndex]!;
+					const isCurrent = ctx.model?.provider === model.provider && ctx.model.id === model.id;
+					const fullLabel = `${isCurrent ? "✓ " : ""}${model.id}`;
+					return { text: fullLabel.length > 64 ? `${fullLabel.slice(0, 63)}…` : fullLabel, callback_data: `model:select:${providerIndex}:${modelIndex}` };
+				});
+			rows.push(row);
+		}
+		const pageCount = Math.ceil(models.length / pageSize);
+		const navigation: Array<{ text: string; callback_data: string }> = [
+			{ text: "‹ Providers", callback_data: `model:providers:${Math.floor(providerIndex / pageSize)}` },
+		];
+		if (page > 0) navigation.push({ text: "‹ Previous", callback_data: `model:page:${providerIndex}:${page - 1}` });
+		if (page + 1 < pageCount) navigation.push({ text: "Next ›", callback_data: `model:page:${providerIndex}:${page + 1}` });
+		rows.push(navigation);
+		return { inline_keyboard: rows };
+	}
+
+	async function renderProviderPicker(chatId: number, ctx: ExtensionContext, page = 0, messageId?: number): Promise<void> {
+		const models = getSelectableModels(ctx);
+		const providers = getSelectableProviders(models);
+		if (providers.length === 0) {
+			const text = "No providers with configured model credentials are available.";
+			if (messageId !== undefined) {
+				await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: [] } });
+			} else {
+				await sendTextReply(chatId, 0, text);
+			}
+			return;
+		}
+		const pageSize = 8;
+		const pageCount = Math.ceil(providers.length / pageSize);
+		const safePage = Math.max(0, Math.min(page, pageCount - 1));
+		const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
+		const text = `Choose a provider (${safePage + 1}/${pageCount}). Current model: ${currentModel}`;
+		const reply_markup = buildProviderKeyboard(ctx, providers, safePage);
+		if (messageId !== undefined) {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup });
+		} else {
+			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text, reply_markup });
+		}
+	}
+
+	async function renderModelPicker(chatId: number, ctx: ExtensionContext, providerIndex: number, page = 0, messageId?: number): Promise<void> {
+		const models = getSelectableModels(ctx);
+		const provider = getSelectableProviders(models)[providerIndex];
+		if (!provider) {
+			if (messageId !== undefined) {
+				await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text: "This provider menu has expired. Send /model again.", reply_markup: { inline_keyboard: [] } });
+			}
+			return;
+		}
+		const providerModels = models.filter((model) => model.provider === provider);
+		const pageSize = 8;
+		const pageCount = Math.ceil(providerModels.length / pageSize);
+		const safePage = Math.max(0, Math.min(page, pageCount - 1));
+		const text = `Choose a model from ${provider} (${safePage + 1}/${pageCount}).`;
+		const reply_markup = buildModelKeyboard(ctx, providerIndex, providerModels, safePage);
+		if (messageId !== undefined) {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup });
+		} else {
+			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text, reply_markup });
+		}
+	}
+
+
+	async function handleModelPickerCallback(query: TelegramCallbackQuery, ctx: ExtensionContext): Promise<void> {
+		const callbackQueryId = query.id;
+		const message = query.message;
+		if (!message || message.chat.type !== "private" || query.from.is_bot || query.from.id !== config.allowedUserId) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This bot is not authorized for your account.", show_alert: true });
+			return;
+		}
+		const match = /^model:(providers|provider|page|select):(\d+)(?::(\d+))?$/.exec(query.data ?? "");
+		if (!match) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired.", show_alert: true });
+			return;
+		}
+		const action = match[1];
+		const index = Number(match[2]);
+		const subIndex = match[3] === undefined ? undefined : Number(match[3]);
+		if (action === "providers") {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+			await renderProviderPicker(message.chat.id, ctx, index, message.message_id);
+			return;
+		}
+		if (action === "provider") {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+			await renderModelPicker(message.chat.id, ctx, index, 0, message.message_id);
+			return;
+		}
+		if (action === "page") {
+			if (subIndex === undefined) {
+				await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired.", show_alert: true });
+				return;
+			}
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+			await renderModelPicker(message.chat.id, ctx, index, subIndex, message.message_id);
+			return;
+		}
+		if (!ctx.isIdle()) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "Pi is busy; try again when it is idle.", show_alert: true });
+			return;
+		}
+		const provider = getSelectableProviders(getSelectableModels(ctx))[index];
+		const model = provider === undefined || subIndex === undefined
+			? undefined
+			: getSelectableModels(ctx).filter((item) => item.provider === provider)[subIndex];
+		if (!model) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired. Send /model again.", show_alert: true });
+			return;
+		}
+		await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+		let text: string;
+		try {
+			text = (await pi.setModel(model)) ? `Model set to ${model.provider}/${model.id}.` : `No configured credentials for ${model.provider}/${model.id}.`;
+		} catch (error) {
+			text = `Could not change model: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		await callTelegram("editMessageText", { chat_id: message.chat.id, message_id: message.message_id, text, reply_markup: { inline_keyboard: [] } });
+	}
+
 	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
-		const lower = rawText.toLowerCase();
+		const [rawCommand = "", ...commandArgs] = rawText.trim().split(/\s+/);
+		const command = rawCommand.toLowerCase();
+		const argument = commandArgs.join(" ").trim();
 
-		if (lower === "stop" || lower === "/stop") {
+		if (command === "stop" || command === "/stop") {
 			if (currentAbort) {
 				if (queuedTelegramTurns.length > 0) {
 					preserveQueuedTurnsAsHistory = true;
@@ -755,7 +933,104 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/compact") {
+		if (command === "/model") {
+			if (!argument) {
+				await renderProviderPicker(firstMessage.chat.id, ctx);
+				return;
+			}
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot change model while pi is busy.");
+				return;
+			}
+			const separator = argument.indexOf("/");
+			if (separator <= 0 || separator === argument.length - 1) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Use /model <provider>/<model-id>.");
+				return;
+			}
+			const model = ctx.modelRegistry.find(argument.slice(0, separator), argument.slice(separator + 1));
+			if (!model) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Unknown model: ${argument}.`);
+				return;
+			}
+			try {
+				if (!(await pi.setModel(model))) {
+					await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `No configured credentials for ${argument}.`);
+					return;
+				}
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Model set to ${model.provider}/${model.id}.`);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Could not change model: ${message}`);
+			}
+			return;
+		}
+
+		if (command === "/context") {
+			const usage = ctx.getContextUsage();
+			if (!usage) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Context: unknown.");
+				return;
+			}
+			const contextWindow = usage.contextWindow ?? ctx.model?.contextWindow ?? 0;
+			const percent = usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "?";
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Context: ${formatTokens(usage.tokens)}/${formatTokens(contextWindow)} (${percent}).`);
+			return;
+		}
+
+		if (command === "/think") {
+			const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+			const currentLevel = pi.getThinkingLevel();
+			if (!argument) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Thinking level: ${currentLevel}. Use /think <${thinkingLevels.join("|")}> to change it.`);
+				return;
+			}
+			const nextLevel = thinkingLevels.find((level) => level === argument.toLowerCase());
+			if (!nextLevel) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Unknown thinking level. Choose one of: ${thinkingLevels.join(", ")}.`);
+				return;
+			}
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot change thinking level while pi is busy.");
+				return;
+			}
+			pi.setThinkingLevel(nextLevel);
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Thinking level set to ${nextLevel}.`);
+			return;
+		}
+
+		if (command === "/new") {
+			if (telegramSessionSwitchPending || !ctx.isIdle() || activeTelegramTurn || queuedTelegramTurns.length > 0) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot start a new session while pi is busy, switching sessions, or Telegram messages are queued.");
+				return;
+			}
+			telegramSessionSwitchPending = true;
+			const parentSession = ctx.sessionManager.getSessionFile();
+			setImmediate(() => {
+				void (async () => {
+					try {
+						config.reconnectAfterSessionSwitch = true;
+						await writeConfig(config);
+						const result = await ctx.newSession({ parentSession });
+					if (result.cancelled) {
+						config.reconnectAfterSessionSwitch = false;
+						await writeConfig(config);
+						await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "New session cancelled; current session preserved.");
+						telegramSessionSwitchPending = false;
+						return;
+					}
+					await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Started a fresh session; previous session preserved.");
+				} catch (error) {
+					telegramSessionSwitchPending = false;
+					config.reconnectAfterSessionSwitch = false;
+					await writeConfig(config).catch(() => undefined);
+					await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Could not start a new session: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+				}
+				})();
+			});
+			return;
+		}
+
+		if (command === "/compact") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
 				return;
@@ -773,7 +1048,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/status") {
+		if (command === "/status") {
 			let totalInput = 0;
 			let totalOutput = 0;
 			let totalCacheRead = 0;
@@ -820,11 +1095,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/help" || lower === "/start") {
+		if (command === "/help" || command === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /new, /status, /context, /compact, /model, /think, /help, /stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -865,6 +1140,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
+		if (update.callback_query) {
+			await handleModelPickerCallback(update.callback_query, ctx);
+			return;
+		}
 		const message = update.message || update.edited_message;
 		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
 
@@ -913,7 +1192,7 @@ export default function (pi: ExtensionAPI) {
 						offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
 						limit: 10,
 						timeout: 30,
-						allowed_updates: ["message", "edited_message"],
+						allowed_updates: ["message", "edited_message", "callback_query"],
 					},
 					{ signal },
 				);
@@ -933,8 +1212,26 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	async function registerTelegramCommands(): Promise<void> {
+		await callTelegram("setMyCommands", {
+			commands: [
+				{ command: "new", description: "Start a fresh session" },
+				{ command: "status", description: "Show model and usage status" },
+				{ command: "context", description: "Show context window usage" },
+				{ command: "compact", description: "Compact the current session" },
+				{ command: "model", description: "Pick a provider and model" },
+				{ command: "think", description: "Show or change thinking level" },
+				{ command: "help", description: "Show help and available commands" },
+				{ command: "stop", description: "Stop the current response" },
+			],
+			scope: { type: "all_private_chats" },
+		});
+		await callTelegram("setChatMenuButton", { menu_button: { type: "commands" } });
+	}
+
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken || pollingPromise) return;
+		await registerTelegramCommands();
 		pollingController = new AbortController();
 		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
 			pollingPromise = undefined;
@@ -1023,6 +1320,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		if (sessionFile) config.currentSessionFile = sessionFile;
+		else delete config.currentSessionFile;
+		const reconnectAfterSessionSwitch = config.reconnectAfterSessionSwitch === true;
+		config.reconnectAfterSessionSwitch = false;
+		await writeConfig(config);
+		if (reconnectAfterSessionSwitch) await startPolling(ctx);
 		updateStatus(ctx);
 	});
 
@@ -1124,7 +1428,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }
