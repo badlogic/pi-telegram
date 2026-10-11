@@ -376,6 +376,61 @@ function isRichUnavailableError(error: unknown): boolean {
 	return RICH_UNAVAILABLE_PATTERN.test(message);
 }
 
+function telegramErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+// Telegram's servers, the proxies in between, and the local network all fail transiently.
+// These failures say nothing about capabilities and must never crash the bridge or turn
+// into a status error; they are retried or silently dropped.
+const TRANSIENT_TELEGRAM_PATTERN =
+	/bad gateway|service unavailable|gateway timeout|internal server error|too many requests|flood|rate limit|timed? ?out|network|fetch failed|socket hang up|econnreset|econnrefused|etimedout|epipe|other side closed|http 5\d\d|http 429/i;
+
+// Errors that mean the update simply does not apply any more: the target message already
+// shows this content, or it is gone. Neither deserves a retry or an error report.
+const HARMLESS_TELEGRAM_PATTERN =
+	/message is not modified|message to edit not found|message to delete not found|message can't be edited|message can't be deleted|message_id invalid|message identifier is not specified/i;
+
+function isTransientTelegramError(error: unknown): boolean {
+	return TRANSIENT_TELEGRAM_PATTERN.test(telegramErrorMessage(error));
+}
+
+function isHarmlessTelegramError(error: unknown): boolean {
+	return HARMLESS_TELEGRAM_PATTERN.test(telegramErrorMessage(error));
+}
+
+const TRANSIENT_RETRY_DELAY_MS = 1500;
+
+/**
+ * One delayed retry for transient Telegram/network failures. Aborts and non-transient
+ * errors propagate to the caller immediately.
+ */
+async function withTelegramRetry<T>(attempt: () => Promise<T>): Promise<T> {
+	try {
+		return await attempt();
+	} catch (error) {
+		if (error instanceof Error && error.name === "AbortError") throw error;
+		if (!isTransientTelegramError(error)) throw error;
+		await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
+		return await attempt();
+	}
+}
+
+async function readTelegramResponse<TResponse>(response: Response, method: string): Promise<TResponse> {
+	// Telegram answers with JSON even for errors, but a failing proxy in between may return
+	// an HTML error page, which response.json() rejects with a parse error.
+	let data: TelegramApiResponse<TResponse> | undefined;
+	try {
+		data = (await response.json()) as TelegramApiResponse<TResponse>;
+	} catch {
+		// non-JSON body (e.g. a proxy's HTML error page)
+	}
+	if (data === undefined || !data.ok || data.result === undefined) {
+		throw new Error(data?.description || `Telegram API ${method} failed (HTTP ${response.status})`);
+	}
+	return data.result;
+}
+
 async function readConfig(): Promise<TelegramConfig> {
 	try {
 		const content = await readFile(CONFIG_PATH, "utf8");
@@ -562,7 +617,16 @@ export default function (pi: ExtensionAPI) {
 		return nextDraftId;
 	}
 
+	/** Status rendering must never crash the bridge: the ctx goes stale after session replacement. */
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
+		try {
+			updateStatusUnsafe(ctx, error);
+		} catch {
+			// stale ctx or transient UI failure
+		}
+	}
+
+	function updateStatusUnsafe(ctx: ExtensionContext, error?: string): void {
 		const theme = ctx.ui.theme;
 		const label = theme.fg("accent", "telegram");
 		if (error) {
@@ -595,17 +659,15 @@ export default function (pi: ExtensionAPI) {
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-			signal: options?.signal,
+		return withTelegramRetry(async () => {
+			const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			});
+			return readTelegramResponse<TResponse>(response, method);
 		});
-			const data = (await response.json()) as TelegramApiResponse<TResponse>;
-		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
-		}
-		return data.result;
 	}
 
 	async function callTelegramMultipart<TResponse>(
@@ -623,16 +685,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		const buffer = await readFile(filePath);
 		form.set(fileField, new Blob([buffer]), fileName);
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			body: form,
-			signal: options?.signal,
+		return withTelegramRetry(async () => {
+			const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
+				method: "POST",
+				body: form,
+				signal: options?.signal,
+			});
+			return readTelegramResponse<TResponse>(response, method);
 		});
-		const data = (await response.json()) as TelegramApiResponse<TResponse>;
-		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
-		}
-		return data.result;
 	}
 
 	async function downloadTelegramFile(fileId: string, suggestedName: string): Promise<string> {
@@ -730,9 +790,12 @@ export default function (pi: ExtensionAPI) {
 				state.draftId = draftId;
 				state.lastSentText = text;
 				return;
-			} catch {
-				richDraftSupport = "unsupported";
+			} catch (error) {
 				state.draftId = undefined;
+				// A transient failure says nothing about rich-draft support: keep it enabled and
+				// let the next flush retry instead of falling back for the rest of the session.
+				if (isTransientTelegramError(error)) return;
+				richDraftSupport = "unsupported";
 			}
 		}
 
@@ -747,28 +810,47 @@ export default function (pi: ExtensionAPI) {
 				state.draftId = draftId;
 				state.lastSentText = text;
 				return;
-			} catch {
-				draftSupport = "unsupported";
+			} catch (error) {
 				state.draftId = undefined;
+				if (isTransientTelegramError(error)) return;
+				draftSupport = "unsupported";
 			}
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await sendMarkdownHtml<TelegramSentMessage>("sendMessage", { chat_id: chatId }, truncated);
-			state.messageId = sent.message_id;
-			state.mode = "message";
-			state.lastSentText = text;
+			try {
+				const sent = await sendMarkdownHtml<TelegramSentMessage>("sendMessage", { chat_id: chatId }, truncated);
+				state.messageId = sent.message_id;
+				state.mode = "message";
+				state.lastSentText = text;
+			} catch {
+				// The preview is disposable: drop it silently. finalizePreview still delivers the
+				// full reply, and the next flush retries with the newer text.
+			}
 			return;
 		}
-		await sendMarkdownHtml("editMessageText", { chat_id: chatId, message_id: state.messageId }, truncated);
-		state.mode = "message";
-		state.lastSentText = text;
+		try {
+			await sendMarkdownHtml("editMessageText", { chat_id: chatId, message_id: state.messageId }, truncated);
+			state.mode = "message";
+			state.lastSentText = text;
+		} catch (error) {
+			if (/message is not modified/i.test(telegramErrorMessage(error))) {
+				// The preview already shows exactly this text.
+				state.lastSentText = text;
+			} else if (isHarmlessTelegramError(error)) {
+				// The previewed message vanished or is no longer editable: start fresh on the
+				// next flush instead of editing a message that will never change again.
+				state.messageId = undefined;
+			}
+			// Transient and fatal errors alike just drop this preview update: a live preview
+			// must never crash the process.
+		}
 	}
 
 	function schedulePreviewFlush(chatId: number): void {
 		if (!previewState || previewState.flushTimer) return;
 		previewState.flushTimer = setTimeout(() => {
-			void flushPreview(chatId);
+			void flushPreview(chatId).catch(() => undefined);
 		}, PREVIEW_THROTTLE_MS);
 	}
 
@@ -787,7 +869,26 @@ export default function (pi: ExtensionAPI) {
 			return true;
 		}
 		previewState = undefined;
-		return state.messageId !== undefined;
+		if (
+			state.messageId !== undefined &&
+			state.lastSentText.trim() === finalText &&
+			finalText.length <= MAX_MESSAGE_LENGTH
+		) {
+			// The preview message already carries the final reply verbatim.
+			return true;
+		}
+		// The preview never became (or could not be brought to) the final reply. Deliver it as
+		// a fresh message: a preview hiccup must never cost the user the reply. The stale
+		// partial preview is dropped best-effort first.
+		if (state.messageId !== undefined) {
+			try {
+				await callTelegram("deleteMessage", { chat_id: chatId, message_id: state.messageId });
+			} catch {
+				// ignore
+			}
+		}
+		await sendRichOrPlainText(chatId, finalText);
+		return true;
 	}
 
 	/**
@@ -1121,11 +1222,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.compact({
 				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.").catch(
+						() => undefined,
+					);
 				},
 				onError: (error) => {
 					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`).catch(
+						() => undefined,
+					);
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
