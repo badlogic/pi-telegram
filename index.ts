@@ -653,6 +653,25 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
 	}
 
+	/**
+	 * `pi.on` behind an error boundary. Handlers await Telegram calls, and a network
+	 * failure must degrade to the status bar instead of surfacing as "Extension ... error"
+	 * from the host. A rejected before_agent_start override simply falls through to the
+	 * default system prompt.
+	 */
+	const onSafe = ((event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown>) => {
+		pi.on(
+			event as never,
+			(async (event: unknown, ctx: ExtensionContext) => {
+				try {
+					return await handler(event, ctx);
+				} catch (error) {
+					updateStatus(ctx, telegramErrorMessage(error));
+				}
+			}) as never,
+		);
+	}) as unknown as ExtensionAPI["on"];
+
 	async function callTelegram<TResponse>(
 		method: string,
 		body: Record<string, unknown>,
@@ -1313,7 +1332,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+			void Promise.resolve(pi.sendUserMessage(turn.content, { deliverAs: "followUp" })).catch(() => undefined);
 		}
 	}
 
@@ -1327,7 +1346,9 @@ export default function (pi: ExtensionAPI) {
 				const state = mediaGroups.get(key);
 				mediaGroups.delete(key);
 				if (!state) return;
-				void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+				dispatchAuthorizedTelegramMessages(state.messages, ctx).catch((error) =>
+					updateStatus(ctx, telegramErrorMessage(error)),
+				);
 			}, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 			mediaGroups.set(key, existing);
 			return;
@@ -1492,13 +1513,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	onSafe("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
 	});
 
-	pi.on("session_shutdown", async (_event, _ctx) => {
+	onSafe("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
@@ -1513,7 +1534,7 @@ export default function (pi: ExtensionAPI) {
 		await stopPolling();
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	onSafe("before_agent_start", async (event) => {
 		const suffix = isTelegramPrompt(event.prompt)
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
 			: SYSTEM_PROMPT_SUFFIX;
@@ -1522,7 +1543,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("agent_start", async (_event, ctx) => {
+	onSafe("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
 		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
 			const nextTurn = queuedTelegramTurns.shift();
@@ -1535,7 +1556,7 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 	});
 
-	pi.on("message_start", async (event, _ctx) => {
+	onSafe("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
 			await finalizePreview(activeTelegramTurn.chatId);
@@ -1543,7 +1564,7 @@ export default function (pi: ExtensionAPI) {
 		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 	});
 
-	pi.on("message_update", async (event, _ctx) => {
+	onSafe("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (!previewState) {
 			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
@@ -1552,7 +1573,7 @@ export default function (pi: ExtensionAPI) {
 		schedulePreviewFlush(activeTelegramTurn.chatId);
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
+	onSafe("agent_end", async (event, ctx) => {
 		const turn = activeTelegramTurn;
 		currentAbort = undefined;
 		stopTypingLoop();
@@ -1596,7 +1617,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
+			void Promise.resolve(pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" })).catch(() => undefined);
 		}
 	});
 }
