@@ -17,6 +17,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",

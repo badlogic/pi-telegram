@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
@@ -7,12 +8,22 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
+import { markdownToTelegramHtml, telegramVisibleLength } from "./markdown.ts";
+
 interface TelegramConfig {
 	botToken?: string;
 	botUsername?: string;
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	/** Render replies as Telegram rich messages (Bot API 10.1+) so Markdown renders natively. Defaults to true. */
+	richMessages?: boolean;
+	/** Transcribe inbound Telegram voice notes to text. Defaults to true. */
+	voiceTranscription?: boolean;
+	/** MLX Whisper model repo used for voice transcription. */
+	voiceModel?: string;
+	/** Language hint for voice transcription; "auto" lets Whisper detect it. Defaults to "auto". */
+	voiceLanguage?: string;
 }
 
 interface TelegramApiResponse<T> {
@@ -83,6 +94,7 @@ interface TelegramFileInfo {
 	fileName: string;
 	mimeType?: string;
 	isImage: boolean;
+	isVoice?: boolean;
 }
 
 interface TelegramMessage {
@@ -119,6 +131,7 @@ interface DownloadedTelegramFile {
 	path: string;
 	fileName: string;
 	isImage: boolean;
+	isVoice?: boolean;
 	mimeType?: string;
 }
 
@@ -137,8 +150,15 @@ interface QueuedAttachment {
 	fileName: string;
 }
 
+/**
+ * Raised when the transcription toolchain itself cannot run (`uv` or the interpreter is
+ * missing). Only this permanently disables voice transcription; a clip that merely fails
+ * to decode stays a per-message problem.
+ */
+class VoiceToolingUnavailableError extends Error {}
+
 interface TelegramPreviewState {
-	mode: "draft" | "message";
+	mode: "rich-draft" | "draft" | "message";
 	draftId?: number;
 	messageId?: number;
 	pendingText: string;
@@ -151,10 +171,92 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+const VOICE_TRANSCRIBE_TIMEOUT_MS = 120_000;
+const DEFAULT_VOICE_MODEL = "mlx-community/whisper-small-mlx";
+// Whisper renders Chinese as Traditional by default; this biases it to Simplified.
+const SIMPLIFIED_CHINESE_PROMPT = "以下是普通话的句子。";
+
+// Piped to `uv run ... python -` on stdin, so the extension stays a single file and we
+// never have to resolve a sibling script path through the extension loader.
+const VOICE_TRANSCRIBE_SCRIPT = `
+import json
+import os
+import sys
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def fail(message):
+    print(json.dumps({"error": message}, ensure_ascii=False))
+    sys.exit(1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        fail("usage: transcribe <audio-path> [model] [language]")
+    path = sys.argv[1]
+    model = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "mlx-community/whisper-small-mlx"
+    language = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "auto"
+
+    try:
+        import av
+        import mlx_whisper
+        import numpy as np
+    except Exception as exc:
+        fail("missing python dependency: " + str(exc))
+
+    # Decode with PyAV, which bundles its own FFmpeg libraries, so no system
+    # ffmpeg binary is required to read Telegram's Ogg/Opus voice notes.
+    try:
+        container = av.open(path)
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
+        blocks = []
+        for frame in container.decode(stream):
+            for resampled in resampler.resample(frame):
+                blocks.append(resampled.to_ndarray())
+        container.close()
+    except Exception as exc:
+        fail("could not decode audio: " + str(exc))
+
+    if not blocks:
+        fail("no audio samples decoded")
+
+    audio = np.concatenate(blocks, axis=1).flatten().astype(np.float32)
+
+    options = {"path_or_hf_repo": model}
+    if language != "auto":
+        options["language"] = language
+    if language == "auto" or language.lower().startswith("zh"):
+        options["initial_prompt"] = ${JSON.stringify(SIMPLIFIED_CHINESE_PROMPT)}
+
+    try:
+        result = mlx_whisper.transcribe(audio, **options)
+    except Exception as exc:
+        fail("transcription failed: " + str(exc))
+
+    print(json.dumps({
+        "text": (result.get("text") or "").strip(),
+        "language": result.get("language"),
+        "durationSeconds": round(float(audio.shape[0]) / 16000.0, 2),
+    }, ensure_ascii=False))
+
+
+main()
+`;
+
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
+// Rich messages allow up to 32768 UTF-8 characters, i.e. 8x the plain-text limit.
+const MAX_RICH_MESSAGE_LENGTH = 32768;
+// Rich messages are only disabled permanently when Telegram says the bot cannot use
+// them at all. Content-specific rejections fall back per message instead, so one
+// unrenderable reply cannot force every later reply back to plain text.
+const RICH_UNAVAILABLE_PATTERN = /not found|unknown method|method not found|not implemented|unsupported/i;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
@@ -212,8 +314,8 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-function chunkParagraphs(text: string): string[] {
-	if (text.length <= MAX_MESSAGE_LENGTH) return [text];
+function chunkParagraphs(text: string, limit: number = MAX_MESSAGE_LENGTH): string[] {
+	if (text.length <= limit) return [text];
 
 	const normalized = text.replace(/\r\n/g, "\n");
 	const paragraphs = normalized.split(/\n\n+/);
@@ -226,13 +328,13 @@ function chunkParagraphs(text: string): string[] {
 	};
 
 	const splitLongBlock = (block: string): string[] => {
-		if (block.length <= MAX_MESSAGE_LENGTH) return [block];
+		if (block.length <= limit) return [block];
 		const lines = block.split("\n");
 		const lineChunks: string[] = [];
 		let lineCurrent = "";
 		for (const line of lines) {
 			const candidate = lineCurrent.length === 0 ? line : `${lineCurrent}\n${line}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= limit) {
 				lineCurrent = candidate;
 				continue;
 			}
@@ -240,12 +342,12 @@ function chunkParagraphs(text: string): string[] {
 				lineChunks.push(lineCurrent);
 				lineCurrent = "";
 			}
-			if (line.length <= MAX_MESSAGE_LENGTH) {
+			if (line.length <= limit) {
 				lineCurrent = line;
 				continue;
 			}
-			for (let i = 0; i < line.length; i += MAX_MESSAGE_LENGTH) {
-				lineChunks.push(line.slice(i, i + MAX_MESSAGE_LENGTH));
+			for (let i = 0; i < line.length; i += limit) {
+				lineChunks.push(line.slice(i, i + limit));
 			}
 		}
 		if (lineCurrent.length > 0) lineChunks.push(lineCurrent);
@@ -257,7 +359,7 @@ function chunkParagraphs(text: string): string[] {
 		const parts = splitLongBlock(paragraph);
 		for (const part of parts) {
 			const candidate = current.length === 0 ? part : `${current}\n\n${part}`;
-			if (candidate.length <= MAX_MESSAGE_LENGTH) {
+			if (candidate.length <= limit) {
 				current = candidate;
 			} else {
 				flushCurrent();
@@ -267,6 +369,66 @@ function chunkParagraphs(text: string): string[] {
 	}
 	flushCurrent();
 	return chunks;
+}
+
+function isRichUnavailableError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return RICH_UNAVAILABLE_PATTERN.test(message);
+}
+
+function telegramErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+// Telegram's servers, the proxies in between, and the local network all fail transiently.
+// These failures say nothing about capabilities and must never crash the bridge or turn
+// into a status error; they are retried or silently dropped.
+const TRANSIENT_TELEGRAM_PATTERN =
+	/bad gateway|service unavailable|gateway timeout|internal server error|too many requests|flood|rate limit|timed? ?out|network|fetch failed|socket hang up|econnreset|econnrefused|etimedout|epipe|other side closed|http 5\d\d|http 429/i;
+
+// Errors that mean the update simply does not apply any more: the target message already
+// shows this content, or it is gone. Neither deserves a retry or an error report.
+const HARMLESS_TELEGRAM_PATTERN =
+	/message is not modified|message to edit not found|message to delete not found|message can't be edited|message can't be deleted|message_id invalid|message identifier is not specified/i;
+
+function isTransientTelegramError(error: unknown): boolean {
+	return TRANSIENT_TELEGRAM_PATTERN.test(telegramErrorMessage(error));
+}
+
+function isHarmlessTelegramError(error: unknown): boolean {
+	return HARMLESS_TELEGRAM_PATTERN.test(telegramErrorMessage(error));
+}
+
+const TRANSIENT_RETRY_DELAY_MS = 1500;
+
+/**
+ * One delayed retry for transient Telegram/network failures. Aborts and non-transient
+ * errors propagate to the caller immediately.
+ */
+async function withTelegramRetry<T>(attempt: () => Promise<T>): Promise<T> {
+	try {
+		return await attempt();
+	} catch (error) {
+		if (error instanceof Error && error.name === "AbortError") throw error;
+		if (!isTransientTelegramError(error)) throw error;
+		await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
+		return await attempt();
+	}
+}
+
+async function readTelegramResponse<TResponse>(response: Response, method: string): Promise<TResponse> {
+	// Telegram answers with JSON even for errors, but a failing proxy in between may return
+	// an HTML error page, which response.json() rejects with a parse error.
+	let data: TelegramApiResponse<TResponse> | undefined;
+	try {
+		data = (await response.json()) as TelegramApiResponse<TResponse>;
+	} catch {
+		// non-JSON body (e.g. a proxy's HTML error page)
+	}
+	if (data === undefined || !data.ok || data.result === undefined) {
+		throw new Error(data?.description || `Telegram API ${method} failed (HTTP ${response.status})`);
+	}
+	return data.result;
 }
 
 async function readConfig(): Promise<TelegramConfig> {
@@ -296,15 +458,175 @@ export default function (pi: ExtensionAPI) {
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	// Rich drafts drive the live streaming preview; rich messages drive persisted replies.
+	// They are tracked separately because Telegram tolerates partial Markdown in drafts
+	// but may still reject a final message, and vice versa.
+	let richDraftSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	let richMessageSupport: "unknown" | "supported" | "unsupported" = "unknown";
+	let lastRichError: string | undefined;
+	// Probed lazily on the first voice note so a missing `uv` never slows startup.
+	let voiceToolingSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+
+	function richEnabled(): boolean {
+		return config.richMessages !== false;
+	}
+
+	function voiceEnabled(): boolean {
+		return config.voiceTranscription !== false;
+	}
+
+	/** Prefer the usual uv install location, then fall back to PATH lookup by spawn. */
+	async function uvBinary(): Promise<string> {
+		const local = join(homedir(), ".local", "bin", "uv");
+		try {
+			await stat(local);
+			return local;
+		} catch {
+			return "uv";
+		}
+	}
+
+	interface VoiceTranscript {
+		text: string;
+		language?: string;
+		durationSeconds?: number;
+	}
+
+	/**
+	 * Transcribes one audio file by piping the embedded Python script to `uv run`, which
+	 * resolves MLX Whisper and PyAV in a cached throwaway environment.
+	 */
+	async function transcribeVoice(audioPath: string): Promise<VoiceTranscript> {
+		const uv = await uvBinary();
+		const model = config.voiceModel?.trim() || DEFAULT_VOICE_MODEL;
+		const language = config.voiceLanguage?.trim() || "auto";
+		const child = spawn(
+			uv,
+			["run", "--quiet", "--with", "mlx-whisper", "--with", "av", "--with", "numpy", "python", "-", audioPath, model, language],
+			{ stdio: ["pipe", "pipe", "pipe"] },
+		);
+
+		const outcome = await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }>(
+			(resolve) => {
+				let stdout = "";
+				let stderr = "";
+				let settled = false;
+				let timedOut = false;
+				const finish = (code: number | null): void => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					resolve({ code, stdout, stderr, timedOut });
+				};
+				const timer = setTimeout(() => {
+					timedOut = true;
+					child.kill("SIGKILL");
+				}, VOICE_TRANSCRIBE_TIMEOUT_MS);
+				child.stdout?.on("data", (chunk) => {
+					stdout += chunk.toString();
+				});
+				child.stderr?.on("data", (chunk) => {
+					stderr += chunk.toString();
+				});
+				child.on("error", (error) => {
+					stderr += error.message;
+					finish(-1);
+				});
+				child.on("close", (code) => finish(code));
+				child.stdin?.end(VOICE_TRANSCRIBE_SCRIPT);
+			},
+		);
+
+		if (outcome.timedOut) throw new Error(`timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS / 1000}s`);
+
+		// The script prints exactly one JSON object as its last stdout line; anything before
+		// it is third-party noise from the Python environment.
+		const lastLine = outcome.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+		let parsed: { text?: string; error?: string; language?: string; durationSeconds?: number } | undefined;
+		try {
+			parsed = JSON.parse(lastLine);
+		} catch {
+			parsed = undefined;
+		}
+
+		if (parsed?.error) throw new Error(parsed.error);
+		if (!parsed || typeof parsed.text !== "string") {
+			const detail = (outcome.stderr || outcome.stdout).trim().split("\n").slice(-2).join(" ").slice(0, 200);
+			if (/ENOENT/.test(outcome.stderr)) {
+				throw new VoiceToolingUnavailableError(detail || "uv is not available");
+			}
+			throw new Error(detail || `transcription process exited with code ${outcome.code}`);
+		}
+
+		return { text: parsed.text, language: parsed.language, durationSeconds: parsed.durationSeconds };
+	}
+
+	/** Keeps Telegram's "typing…" indicator alive for slow work before a turn is queued. */
+	async function withTypingIndicator<T>(chatId: number, work: () => Promise<T>): Promise<T> {
+		const tick = (): void => {
+			void callTelegram("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => undefined);
+		};
+		tick();
+		const timer = setInterval(tick, 4000);
+		try {
+			return await work();
+		} finally {
+			clearInterval(timer);
+		}
+	}
+
+	async function transcribeVoiceNotes(chatId: number, files: DownloadedTelegramFile[]): Promise<string[]> {
+		const notes: string[] = [];
+		const voiceFiles = files.filter((file) => file.isVoice);
+		if (voiceFiles.length === 0) return notes;
+		if (!voiceEnabled()) return notes;
+
+		await withTypingIndicator(chatId, async () => {
+			for (const file of voiceFiles) {
+				if (voiceToolingSupport === "unsupported") {
+					notes.push("Voice message (transcription unavailable in this environment).");
+					continue;
+				}
+				try {
+					const transcript = await transcribeVoice(file.path);
+					voiceToolingSupport = "supported";
+					notes.push(transcript.text.length > 0 ? `Voice message transcript: ${transcript.text}` : "Voice message (transcribed as empty audio).");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					if (error instanceof VoiceToolingUnavailableError) voiceToolingSupport = "unsupported";
+					notes.push(`Voice message (transcription failed: ${message.slice(0, 200)}).`);
+				}
+			}
+		});
+
+		return notes;
+	}
+
+	/**
+	 * Longest reply that can be finalized in place from the streamed preview instead of
+	 * being cleared and re-sent. Rich messages lift this to 32768 characters.
+	 */
+	function maxInPlaceReplyLength(): number {
+		return richEnabled() && richMessageSupport !== "unsupported" ? MAX_RICH_MESSAGE_LENGTH : MAX_MESSAGE_LENGTH;
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
 		return nextDraftId;
 	}
 
+	/** Status rendering must never crash the bridge: the ctx goes stale after session replacement. */
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
+		try {
+			updateStatusUnsafe(ctx, error);
+		} catch {
+			// stale ctx or transient UI failure
+		}
+	}
+
+	function updateStatusUnsafe(ctx: ExtensionContext, error?: string): void {
 		const theme = ctx.ui.theme;
 		const label = theme.fg("accent", "telegram");
 		if (error) {
@@ -331,23 +653,40 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
 	}
 
+	/**
+	 * `pi.on` behind an error boundary. Handlers await Telegram calls, and a network
+	 * failure must degrade to the status bar instead of surfacing as "Extension ... error"
+	 * from the host. A rejected before_agent_start override simply falls through to the
+	 * default system prompt.
+	 */
+	const onSafe = ((event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown>) => {
+		pi.on(
+			event as never,
+			(async (event: unknown, ctx: ExtensionContext) => {
+				try {
+					return await handler(event, ctx);
+				} catch (error) {
+					updateStatus(ctx, telegramErrorMessage(error));
+				}
+			}) as never,
+		);
+	}) as unknown as ExtensionAPI["on"];
+
 	async function callTelegram<TResponse>(
 		method: string,
 		body: Record<string, unknown>,
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-			signal: options?.signal,
+		return withTelegramRetry(async () => {
+			const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			});
+			return readTelegramResponse<TResponse>(response, method);
 		});
-			const data = (await response.json()) as TelegramApiResponse<TResponse>;
-		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
-		}
-		return data.result;
 	}
 
 	async function callTelegramMultipart<TResponse>(
@@ -365,16 +704,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		const buffer = await readFile(filePath);
 		form.set(fileField, new Blob([buffer]), fileName);
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			body: form,
-			signal: options?.signal,
+		return withTelegramRetry(async () => {
+			const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
+				method: "POST",
+				body: form,
+				signal: options?.signal,
+			});
+			return readTelegramResponse<TResponse>(response, method);
 		});
-		const data = (await response.json()) as TelegramApiResponse<TResponse>;
-		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
-		}
-		return data.result;
 	}
 
 	async function downloadTelegramFile(fileId: string, suggestedName: string): Promise<string> {
@@ -444,6 +781,8 @@ export default function (pi: ExtensionAPI) {
 				// ignore
 			}
 		}
+		// Rich drafts cannot be dismissed the same way: Telegram rejects empty Markdown with
+		// RICH_MESSAGE_MARKDOWN_INVALID. They expire on their own after ~30 seconds.
 	}
 
 	async function flushPreview(chatId: number): Promise<void> {
@@ -452,38 +791,85 @@ export default function (pi: ExtensionAPI) {
 		state.flushTimer = undefined;
 		const text = state.pendingText.trim();
 		if (!text || text === state.lastSentText) return;
+
+		// Prefer rich drafts so the live preview renders Markdown too. Telegram renders
+		// partial/incomplete Markdown while streaming without erroring.
+		if (richEnabled() && richDraftSupport !== "unsupported") {
+			const draftId =
+				state.mode === "rich-draft" && state.draftId !== undefined ? state.draftId : allocateDraftId();
+			const richText = text.length > MAX_RICH_MESSAGE_LENGTH ? text.slice(0, MAX_RICH_MESSAGE_LENGTH) : text;
+			try {
+				await callTelegram("sendRichMessageDraft", {
+					chat_id: chatId,
+					draft_id: draftId,
+					rich_message: { markdown: richText },
+				});
+				richDraftSupport = "supported";
+				state.mode = "rich-draft";
+				state.draftId = draftId;
+				state.lastSentText = text;
+				return;
+			} catch (error) {
+				state.draftId = undefined;
+				// A transient failure says nothing about rich-draft support: keep it enabled and
+				// let the next flush retry instead of falling back for the rest of the session.
+				if (isTransientTelegramError(error)) return;
+				richDraftSupport = "unsupported";
+			}
+		}
+
 		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
 
 		if (draftSupport !== "unsupported") {
-			const draftId = state.draftId ?? allocateDraftId();
-			state.draftId = draftId;
+			const draftId = state.mode === "draft" && state.draftId !== undefined ? state.draftId : allocateDraftId();
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				await sendMarkdownHtml("sendMessageDraft", { chat_id: chatId, draft_id: draftId }, truncated);
 				draftSupport = "supported";
 				state.mode = "draft";
-				state.lastSentText = truncated;
+				state.draftId = draftId;
+				state.lastSentText = text;
 				return;
-			} catch {
+			} catch (error) {
+				state.draftId = undefined;
+				if (isTransientTelegramError(error)) return;
 				draftSupport = "unsupported";
 			}
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
-			state.messageId = sent.message_id;
-			state.mode = "message";
-			state.lastSentText = truncated;
+			try {
+				const sent = await sendMarkdownHtml<TelegramSentMessage>("sendMessage", { chat_id: chatId }, truncated);
+				state.messageId = sent.message_id;
+				state.mode = "message";
+				state.lastSentText = text;
+			} catch {
+				// The preview is disposable: drop it silently. finalizePreview still delivers the
+				// full reply, and the next flush retries with the newer text.
+			}
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
-		state.mode = "message";
-		state.lastSentText = truncated;
+		try {
+			await sendMarkdownHtml("editMessageText", { chat_id: chatId, message_id: state.messageId }, truncated);
+			state.mode = "message";
+			state.lastSentText = text;
+		} catch (error) {
+			if (/message is not modified/i.test(telegramErrorMessage(error))) {
+				// The preview already shows exactly this text.
+				state.lastSentText = text;
+			} else if (isHarmlessTelegramError(error)) {
+				// The previewed message vanished or is no longer editable: start fresh on the
+				// next flush instead of editing a message that will never change again.
+				state.messageId = undefined;
+			}
+			// Transient and fatal errors alike just drop this preview update: a live preview
+			// must never crash the process.
+		}
 	}
 
 	function schedulePreviewFlush(chatId: number): void {
 		if (!previewState || previewState.flushTimer) return;
 		previewState.flushTimer = setTimeout(() => {
-			void flushPreview(chatId);
+			void flushPreview(chatId).catch(() => undefined);
 		}, PREVIEW_THROTTLE_MS);
 	}
 
@@ -496,26 +882,114 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(chatId);
 			return false;
 		}
-		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+		if (state.mode === "rich-draft" || state.mode === "draft") {
+			await sendRichOrPlainText(chatId, finalText);
 			await clearPreview(chatId);
 			return true;
 		}
 		previewState = undefined;
-		return state.messageId !== undefined;
+		if (
+			state.messageId !== undefined &&
+			state.lastSentText.trim() === finalText &&
+			finalText.length <= MAX_MESSAGE_LENGTH
+		) {
+			// The preview message already carries the final reply verbatim.
+			return true;
+		}
+		// The preview never became (or could not be brought to) the final reply. Deliver it as
+		// a fresh message: a preview hiccup must never cost the user the reply. The stale
+		// partial preview is dropped best-effort first.
+		if (state.messageId !== undefined) {
+			try {
+				await callTelegram("deleteMessage", { chat_id: chatId, message_id: state.messageId });
+			} catch {
+				// ignore
+			}
+		}
+		await sendRichOrPlainText(chatId, finalText);
+		return true;
+	}
+
+	/**
+	 * Sends text with `parse_mode: "HTML"` after converting Markdown. If Telegram rejects
+	 * the message for any reason it is retried without formatting: a formatting bug must
+	 * never cost the user a reply. The plain attempt's error propagates, so the callers
+	 * that probe for capabilities still see the real reason a method is unavailable.
+	 */
+	async function sendMarkdownHtml<TResponse>(
+		method: string,
+		body: Record<string, unknown>,
+		markdown: string,
+	): Promise<TResponse> {
+		try {
+			return await callTelegram<TResponse>(method, {
+				...body,
+				text: markdownToTelegramHtml(markdown),
+				parse_mode: "HTML",
+			});
+		} catch {
+			return await callTelegram<TResponse>(method, { ...body, text: markdown });
+		}
+	}
+
+	/**
+	 * Sends one Markdown chunk as a new message. Telegram measures the text after entity
+	 * parsing, and aligned table padding can make a converted chunk wider than its
+	 * Markdown source, so a chunk that would not fit is halved and retried instead of
+	 * being rejected by the API.
+	 */
+	async function sendMarkdownChunk(chatId: number, markdown: string, depth = 0): Promise<number | undefined> {
+		const fits = telegramVisibleLength(markdownToTelegramHtml(markdown)) <= MAX_MESSAGE_LENGTH;
+		if (!fits && markdown.length > 1 && depth < 4) {
+			let lastMessageId: number | undefined;
+			const half = Math.max(1, Math.ceil(markdown.length / 2));
+			for (const part of chunkParagraphs(markdown, half)) {
+				lastMessageId = (await sendMarkdownChunk(chatId, part, depth + 1)) ?? lastMessageId;
+			}
+			return lastMessageId;
+		}
+		const sent = await sendMarkdownHtml<TelegramSentMessage>("sendMessage", { chat_id: chatId }, markdown);
+		return sent.message_id;
+	}
+
+	/**
+	 * Sends text, preferring Telegram rich messages (Bot API 10.1+) so Markdown renders
+	 * natively. Falls back to Markdown converted to Telegram HTML, and finally to plain
+	 * text when even that is rejected, so a reply is never dropped.
+	 */
+	async function sendRichOrPlainText(chatId: number, text: string): Promise<number | undefined> {
+		const richUsable = richEnabled() && richMessageSupport !== "unsupported";
+		const chunks = chunkParagraphs(text, richUsable ? MAX_RICH_MESSAGE_LENGTH : MAX_MESSAGE_LENGTH);
+		let lastMessageId: number | undefined;
+
+		for (const chunk of chunks) {
+			if (richEnabled() && richMessageSupport !== "unsupported") {
+				try {
+					const sent = await callTelegram<TelegramSentMessage>("sendRichMessage", {
+						chat_id: chatId,
+						rich_message: { markdown: chunk },
+					});
+					richMessageSupport = "supported";
+					lastRichError = undefined;
+					lastMessageId = sent.message_id;
+					continue;
+				} catch (error) {
+					lastRichError = error instanceof Error ? error.message : String(error);
+					if (isRichUnavailableError(error)) richMessageSupport = "unsupported";
+				}
+			}
+
+			// A chunk sized for rich messages may exceed the plain-text limit, so re-split it.
+			for (const plainChunk of chunk.length > MAX_MESSAGE_LENGTH ? chunkParagraphs(chunk) : [chunk]) {
+				lastMessageId = (await sendMarkdownChunk(chatId, plainChunk)) ?? lastMessageId;
+			}
+		}
+
+		return lastMessageId;
 	}
 
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
-		let lastMessageId: number | undefined;
-		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
-			lastMessageId = sent.message_id;
-		}
-		return lastMessageId;
+		return sendRichOrPlainText(chatId, text);
 	}
 
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
@@ -605,6 +1079,7 @@ export default function (pi: ExtensionAPI) {
 					fileName: `voice-${message.message_id}${guessExtensionFromMime(message.voice.mime_type, ".ogg")}`,
 					mimeType: message.voice.mime_type,
 					isImage: false,
+					isVoice: true,
 				});
 			}
 			if (message.animation) {
@@ -632,7 +1107,7 @@ export default function (pi: ExtensionAPI) {
 		const downloaded: DownloadedTelegramFile[] = [];
 		for (const file of collectTelegramFileInfos(messages)) {
 			const path = await downloadTelegramFile(file.file_id, file.fileName);
-			downloaded.push({ path, fileName: file.fileName, isImage: file.isImage, mimeType: file.mimeType });
+			downloaded.push({ path, fileName: file.fileName, isImage: file.isImage, isVoice: file.isVoice, mimeType: file.mimeType });
 		}
 		return downloaded;
 	}
@@ -692,6 +1167,7 @@ export default function (pi: ExtensionAPI) {
 		if (!firstMessage) throw new Error("Missing Telegram message for turn creation");
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).filter(Boolean).join("\n\n");
 		const files = await buildTelegramFiles(messages);
+		const voiceNotes = await transcribeVoiceNotes(firstMessage.chat.id, files);
 		const content: Array<TextContent | ImageContent> = [];
 		let prompt = `${TELEGRAM_PREFIX}`;
 
@@ -705,6 +1181,9 @@ export default function (pi: ExtensionAPI) {
 
 		if (rawText.length > 0) {
 			prompt += historyTurns.length > 0 ? `\n${rawText}` : ` ${rawText}`;
+		}
+		for (const note of voiceNotes) {
+			prompt += `\n\n${note}`;
 		}
 		if (files.length > 0) {
 			prompt += `\n\nTelegram attachments were saved locally:`;
@@ -762,11 +1241,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.compact({
 				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.").catch(
+						() => undefined,
+					);
 				},
 				onError: (error) => {
 					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`).catch(
+						() => undefined,
+					);
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
@@ -791,6 +1274,14 @@ export default function (pi: ExtensionAPI) {
 
 			const usage = ctx.getContextUsage();
 			const lines: string[] = [];
+			const richStatus = !richEnabled()
+				? "off"
+				: richMessageSupport === "unsupported"
+					? "unavailable"
+					: lastRichError
+						? `fallback (${lastRichError})`
+						: "on";
+			lines.push(`Rich: ${richStatus}`);
 			if (ctx.model) {
 				lines.push(`Model: ${ctx.model.provider}/${ctx.model.id}`);
 			}
@@ -841,7 +1332,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
+			void Promise.resolve(pi.sendUserMessage(turn.content, { deliverAs: "followUp" })).catch(() => undefined);
 		}
 	}
 
@@ -855,7 +1346,9 @@ export default function (pi: ExtensionAPI) {
 				const state = mediaGroups.get(key);
 				mediaGroups.delete(key);
 				if (!state) return;
-				void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+				dispatchAuthorizedTelegramMessages(state.messages, ctx).catch((error) =>
+					updateStatus(ctx, telegramErrorMessage(error)),
+				);
 			}, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 			mediaGroups.set(key, existing);
 			return;
@@ -1020,13 +1513,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	onSafe("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
 	});
 
-	pi.on("session_shutdown", async (_event, _ctx) => {
+	onSafe("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
@@ -1041,7 +1534,7 @@ export default function (pi: ExtensionAPI) {
 		await stopPolling();
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	onSafe("before_agent_start", async (event) => {
 		const suffix = isTelegramPrompt(event.prompt)
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
 			: SYSTEM_PROMPT_SUFFIX;
@@ -1050,7 +1543,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("agent_start", async (_event, ctx) => {
+	onSafe("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
 		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
 			const nextTurn = queuedTelegramTurns.shift();
@@ -1063,7 +1556,7 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 	});
 
-	pi.on("message_start", async (event, _ctx) => {
+	onSafe("message_start", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (previewState && (previewState.pendingText.trim().length > 0 || previewState.lastSentText.trim().length > 0)) {
 			await finalizePreview(activeTelegramTurn.chatId);
@@ -1071,7 +1564,7 @@ export default function (pi: ExtensionAPI) {
 		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 	});
 
-	pi.on("message_update", async (event, _ctx) => {
+	onSafe("message_update", async (event, _ctx) => {
 		if (!activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (!previewState) {
 			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
@@ -1080,7 +1573,7 @@ export default function (pi: ExtensionAPI) {
 		schedulePreviewFlush(activeTelegramTurn.chatId);
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
+	onSafe("agent_end", async (event, ctx) => {
 		const turn = activeTelegramTurn;
 		currentAbort = undefined;
 		stopTypingLoop();
@@ -1104,7 +1597,7 @@ export default function (pi: ExtensionAPI) {
 			previewState.pendingText = finalText ?? previewState.pendingText;
 		}
 
-		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
+		if (finalText && finalText.length <= maxInPlaceReplyLength()) {
 			const finalized = await finalizePreview(turn.chatId);
 			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
 				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
@@ -1124,7 +1617,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			void Promise.resolve(pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" })).catch(() => undefined);
 		}
 	});
 }
