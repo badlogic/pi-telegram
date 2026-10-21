@@ -121,6 +121,35 @@ That aborts the active pi turn.
 
 If you send more Telegram messages while pi is busy, they are queued and processed in order.
 
+### Start a new session
+
+In Telegram, send:
+
+```text
+/new
+```
+
+This starts a fresh pi session and keeps the Telegram bridge connected. The previous session is recorded as the parent of the new one, so the session history stays linked.
+
+The switch happens inside the running pi process; pi does not have to be restarted.
+
+### Switch to a previous session
+
+In Telegram, send:
+
+```text
+/resume
+```
+
+The bridge replies with the most recent sessions for the current working directory, most recently modified first. Reply with a number to switch:
+
+```text
+/resume
+2
+```
+
+Session switches triggered from Telegram keep the bridge polling, so the bot stays reachable in the new session.
+
 ## Streaming
 
 The extension streams assistant text previews back to Telegram while pi is generating.
@@ -133,6 +162,7 @@ It tries Telegram draft streaming first with `sendMessageDraft`. If that is not 
 - Replies are sent as normal Telegram messages, not quote-replies
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
+- `/new` and `/resume` switch the pi session the bridge is attached to; the bridge reconnects automatically
 
 ## License
 

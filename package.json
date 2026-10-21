@@ -17,6 +17,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "scripts": {
+    "test": "node --experimental-strip-types --test --test-timeout=15000 telegram-regression.test.mjs"
+  },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",

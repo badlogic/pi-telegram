@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
@@ -13,6 +14,8 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	/** Set before a session switch so the bridge can resume polling afterwards. */
+	reconnectAfterSessionSwitch?: boolean;
 }
 
 interface TelegramApiResponse<T> {
@@ -212,6 +215,30 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+const SESSION_LIST_LIMIT = 10;
+
+interface SessionChoice {
+	path: string;
+	title: string;
+	detail: string;
+}
+
+function truncateText(text: string, max: number): string {
+	const clean = text.replace(/\s+/g, " ").trim();
+	return clean.length <= max ? clean : `${clean.slice(0, max - 1)}…`;
+}
+
+function formatRelativeTime(date: Date): string {
+	const minutes = Math.round((Date.now() - date.getTime()) / 60000);
+	if (minutes < 1) return "just now";
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${hours}h ago`;
+	const days = Math.round(hours / 24);
+	if (days < 30) return `${days}d ago`;
+	return date.toISOString().slice(0, 10);
+}
+
 function chunkParagraphs(text: string): string[] {
 	if (text.length <= MAX_MESSAGE_LENGTH) return [text];
 
@@ -298,6 +325,12 @@ export default function (pi: ExtensionAPI) {
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+	/** Set when a session switch should keep the Telegram bridge polling. */
+	let shouldResumePolling = false;
+	/** Telegram message to reply to once a session switch completes. */
+	let pendingSessionReply: { chatId: number; messageId: number } | undefined;
+	/** Sessions offered for selection by /resume. */
+	let pendingSessionChoices: SessionChoice[] | undefined;
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -735,6 +768,21 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	async function buildSessionChoices(cwd: string, sessionDir: string): Promise<SessionChoice[]> {
+		const sessions = await SessionManager.list(cwd, sessionDir);
+		const sorted = [...sessions].sort((a, b) => b.modified.getTime() - a.modified.getTime());
+		return sorted.slice(0, SESSION_LIST_LIMIT).map((session) => ({
+			path: session.path,
+			title: session.name || truncateText(session.firstMessage || "(untitled)", 48),
+			detail: `${formatRelativeTime(session.modified)} · ${session.messageCount} msgs`,
+		}));
+	}
+
+	function formatSessionChoices(choices: SessionChoice[]): string {
+		const lines = choices.map((choice, index) => `${index + 1}. ${choice.title}\n   ${choice.detail}`);
+		return `Recent sessions:\n${lines.join("\n")}\n\nReply with a number to switch.`;
+	}
+
 	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
@@ -770,6 +818,48 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
+			return;
+		}
+
+		if (lower === "/new") {
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot start a new session while pi is busy. Send \"stop\" first.");
+				return;
+			}
+			pendingSessionChoices = undefined;
+			pendingSessionReply = { chatId: firstMessage.chat.id, messageId: firstMessage.message_id };
+			pi.sendUserMessage("/telegram-new", { expandPromptTemplates: true });
+			return;
+		}
+
+		if (lower === "/resume") {
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot switch sessions while pi is busy. Send \"stop\" first.");
+				return;
+			}
+			const choices = await buildSessionChoices(ctx.cwd, ctx.sessionManager.getSessionDir());
+			if (choices.length === 0) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "No previous sessions found for this directory.");
+				return;
+			}
+			pendingSessionChoices = choices;
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, formatSessionChoices(choices));
+			return;
+		}
+
+		const selection = rawText.trim();
+		if (pendingSessionChoices && /^\d+$/.test(selection)) {
+			const index = Number.parseInt(selection, 10) - 1;
+			if (index < 0 || index >= pendingSessionChoices.length) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Invalid selection. Reply with a number between 1 and ${pendingSessionChoices.length}.`);
+				return;
+			}
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot switch sessions while pi is busy. Send \"stop\" first.");
+				return;
+			}
+			pendingSessionReply = { chatId: firstMessage.chat.id, messageId: firstMessage.message_id };
+			pi.sendUserMessage(`/telegram-resume ${index + 1}`, { expandPromptTemplates: true });
 			return;
 		}
 
@@ -824,7 +914,7 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /compact, /new, /resume, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -1020,13 +1110,87 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("telegram-new", {
+		description: "Start a new pi session and keep the Telegram bridge connected",
+		handler: async (_args, ctx) => {
+			const reply = pendingSessionReply;
+			pendingSessionReply = undefined;
+			pendingSessionChoices = undefined;
+			const parentSession = ctx.sessionManager.getSessionFile();
+			// Persist the reconnect intent so the bridge comes back after the switch.
+			config = await readConfig();
+			config.reconnectAfterSessionSwitch = true;
+			await writeConfig(config);
+			const result = await ctx.newSession({
+				parentSession,
+				withSession: async () => {
+					if (reply) {
+						await sendTextReply(reply.chatId, reply.messageId, "Started a new session. The bridge stays connected.");
+					}
+				},
+			});
+			if (result.cancelled) {
+				config.reconnectAfterSessionSwitch = false;
+				await writeConfig(config);
+				if (reply) {
+					await sendTextReply(reply.chatId, reply.messageId, "Session switch was cancelled.");
+				}
+			}
+		},
+	});
+
+	pi.registerCommand("telegram-resume", {
+		description: "Switch to a previous pi session and keep the Telegram bridge connected",
+		handler: async (args, ctx) => {
+			const reply = pendingSessionReply;
+			const choices = pendingSessionChoices;
+			const index = Number.parseInt(args.trim(), 10) - 1;
+			const choice = choices?.[index];
+			if (!choice) {
+				if (reply) {
+					await sendTextReply(reply.chatId, reply.messageId, "No session selected. Send /resume first.");
+				}
+				return;
+			}
+			pendingSessionReply = undefined;
+			pendingSessionChoices = undefined;
+			config = await readConfig();
+			config.reconnectAfterSessionSwitch = true;
+			await writeConfig(config);
+			const result = await ctx.switchSession(choice.path, {
+				withSession: async () => {
+					if (reply) {
+						await sendTextReply(reply.chatId, reply.messageId, `Switched to session: ${choice.title}`);
+					}
+				},
+			});
+			if (result.cancelled) {
+				config.reconnectAfterSessionSwitch = false;
+				await writeConfig(config);
+				if (reply) {
+					await sendTextReply(reply.chatId, reply.messageId, "Session switch was cancelled.");
+				}
+			}
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
+		// The reconnect intent is persisted in the config file: in-memory state does not
+		// survive a session replacement or an extension reload. The in-memory flag is
+		// only a fallback for the case where writing the config failed.
+		if (config.reconnectAfterSessionSwitch === true || shouldResumePolling) {
+			config.reconnectAfterSessionSwitch = false;
+			shouldResumePolling = false;
+			await writeConfig(config);
+			await startPolling(ctx);
+		}
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
+		shouldResumePolling = pollingPromise !== undefined;
 		queuedTelegramTurns = [];
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
