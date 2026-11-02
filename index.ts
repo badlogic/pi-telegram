@@ -1042,7 +1042,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event) => {
-		const suffix = isTelegramPrompt(event.prompt)
+		const suffix = isTelegramPrompt(event.prompt ?? "")
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
 			: SYSTEM_PROMPT_SUFFIX;
 		return {
